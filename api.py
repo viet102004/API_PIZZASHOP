@@ -14,7 +14,6 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 UPLOAD_FOLDER = "static/images/avatar"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-from fastapi import UploadFile, File
 
 @app.put("/danhmuc/{ma_danh_muc}")
 def update_danh_muc(
