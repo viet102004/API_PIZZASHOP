@@ -71,7 +71,7 @@ CREATE TABLE SanPham (
     gia_co_ban DECIMAL(10, 2) NOT NULL,
     hien_thi BOOLEAN DEFAULT TRUE,
     ma_danh_muc BIGINT,
-    loai_san_pham VARCHAR(50), 
+    loai_san_pham VARCHAR(50),
     moi BOOLEAN DEFAULT FALSE,
     ngay_tao DATETIME DEFAULT CURRENT_TIMESTAMP,
     ngay_cap_nhat DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
