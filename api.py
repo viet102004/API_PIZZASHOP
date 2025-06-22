@@ -1,6 +1,6 @@
 from fastapi import File, UploadFile, FastAPI, HTTPException, Form, Path
 import os, shutil
-from typing import Literal, Optional
+from typing import Literal, Optional, List
 from mysql.connector import Error
 import db
 from fastapi.responses import JSONResponse
@@ -9,6 +9,149 @@ from websocket_routes import router as websocket_router, broadcast_update
 from datetime import date
 
 app = FastAPI()
+
+@app.put("/nguoi-dung/{ma_nguoi_dung}/doi-email")
+def update_email(ma_nguoi_dung: int, email: str = Form(...)):
+    return _update_field("email", email, ma_nguoi_dung)
+
+@app.put("/nguoi-dung/{ma_nguoi_dung}/doi-so-dien-thoai")
+def update_sdt(ma_nguoi_dung: int, so_dien_thoai: str = Form(...)):
+    return _update_field("so_dien_thoai", so_dien_thoai, ma_nguoi_dung)
+
+@app.put("/nguoi-dung/{ma_nguoi_dung}/doi-mat-khau")
+def update_mat_khau(ma_nguoi_dung: int, mat_khau: str = Form(...)):
+    return _update_field("mat_khau", mat_khau, ma_nguoi_dung)
+
+@app.put("/nguoi-dung/{ma_nguoi_dung}/doi-anh-dai-dien")
+def update_anh_dai_dien(ma_nguoi_dung: int, anh_dai_dien: UploadFile = File(...)):
+    try:
+        filename = f"user_{ma_nguoi_dung}_{anh_dai_dien.filename}"
+        save_path = os.path.join(UPLOAD_FOLDER, filename)
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+        with open(save_path, "wb") as buffer:
+            shutil.copyfileobj(anh_dai_dien.file, buffer)
+
+        image_path = f"/{save_path.replace(os.sep, '/')}"
+        return _update_field("anh_dai_dien", image_path, ma_nguoi_dung)
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi khi cập nhật ảnh đại diện: {str(e)}")
+
+
+def _update_field(field_name: str, field_value, ma_nguoi_dung: int):
+    try:
+        conn = db.connect_to_database()
+        if isinstance(conn, Error):
+            raise HTTPException(status_code=500, detail="Lỗi kết nối cơ sở dữ liệu")
+
+        cursor = conn.cursor()
+        sql = f"UPDATE NguoiDung SET {field_name} = %s WHERE ma_nguoi_dung = %s"
+        cursor.execute(sql, (field_value, ma_nguoi_dung))
+        conn.commit()
+        cursor.close()
+        conn.close()
+
+        return {
+            "message": f"Cập nhật {field_name} thành công",
+            "ma_nguoi_dung": ma_nguoi_dung
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi server: {str(e)}")
+
+@app.put("/nguoi-dung/{ma_nguoi_dung}/doi-ten")
+def update_ho_ten(ma_nguoi_dung: int, ho_ten: str = Form(...)):
+    return _update_field("ho_ten", ho_ten, ma_nguoi_dung)
+
+@app.post("/dang-nhap")
+def dang_nhap(
+    tai_khoan: str = Form(...),  # có thể là email hoặc số điện thoại
+    mat_khau: str = Form(...)
+):
+    try:
+        conn = db.connect_to_database()
+        if isinstance(conn, Error):
+            raise HTTPException(status_code=500, detail="Lỗi kết nối cơ sở dữ liệu")
+
+        cursor = conn.cursor(dictionary=True)
+
+        sql = """
+            SELECT * FROM NguoiDung
+            WHERE (email = %s OR so_dien_thoai = %s) AND mat_khau = %s AND hoat_dong = TRUE
+        """
+        cursor.execute(sql, (tai_khoan, tai_khoan, mat_khau))
+        user = cursor.fetchone()
+
+        cursor.close()
+        conn.close()
+
+        if not user:
+            raise HTTPException(status_code=401, detail="Sai tài khoản hoặc mật khẩu")
+
+        # Ẩn mật khẩu khi trả về
+        user.pop("mat_khau", None)
+
+        return {
+            "message": "Đăng nhập thành công",
+            "user": user
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi server: {str(e)}")
+
+@app.get("/san-pham/{id}")
+def get_san_pham_by_id(id: int):
+    try:
+        conn = db.connect_to_database()
+        if not isinstance(conn, Error):
+            cursor = conn.cursor(dictionary=True)
+
+            sql = """
+                SELECT ma_san_pham, ten_san_pham, hinh_anh, gia_co_ban, mo_ta, moi
+                FROM SanPham
+                WHERE ma_san_pham = %s
+            """
+            cursor.execute(sql, (id,))
+            result = cursor.fetchone()
+
+            cursor.close()
+            conn.close()
+
+            if result:
+                return result
+            else:
+                raise HTTPException(status_code=404, detail="Không tìm thấy sản phẩm")
+        else:
+            raise HTTPException(status_code=500, detail="Lỗi kết nối cơ sở dữ liệu")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi server: {str(e)}")
+
+@app.get("/hinh-anh-san-pham/{ma_san_pham}")
+def get_hinh_anh_san_pham(ma_san_pham: int):
+    try:
+        conn = db.connect_to_database()
+        if not isinstance(conn, Error):
+            cursor = conn.cursor(dictionary=True)
+
+            sql = """
+                SELECT ma_hinh_anh, ma_san_pham, url_hinh_anh, thu_tu
+                FROM HinhAnhSanPham
+                WHERE ma_san_pham = %s
+                ORDER BY thu_tu ASC
+            """
+
+            cursor.execute(sql, (ma_san_pham,))
+            results = cursor.fetchall()
+
+            cursor.close()
+            conn.close()
+
+            return results  # Trả về list cho Retrofit hoặc client dùng trực tiếp
+        else:
+            raise HTTPException(status_code=500, detail="Lỗi kết nối cơ sở dữ liệu")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi server: {str(e)}")
 
 @app.get("/banner-hoat-dong")
 def get_active_banners():
@@ -340,15 +483,22 @@ def add_danh_muc(
     
 @app.post("/themHinhAnhSanPham")
 def add_hinh_anh_san_pham(
-    ma_san_pham: int,
-    hinh_anh: UploadFile = File(...),
-    thu_tu: int = 0,
+    ma_san_pham: int = Form(...),
+    hinh_anh_list: List[UploadFile] = File(...),
+    thu_tu_bat_dau: int = Form(0)
 ):
     try:
-        # Xử lý lưu ảnh
-        hinh_anh_path = None
-        if hinh_anh:
-            filename = f"{ma_san_pham}_{hinh_anh.filename}"
+        conn = db.connect_to_database()
+        if isinstance(conn, Error):
+            raise HTTPException(status_code=500, detail="Lỗi kết nối cơ sở dữ liệu")
+
+        cursor = conn.cursor()
+        added_images = []
+
+        thu_tu = thu_tu_bat_dau
+        for hinh_anh in hinh_anh_list:
+            # Tạo đường dẫn lưu ảnh
+            filename = f"{ma_san_pham}_{thu_tu}_{hinh_anh.filename}"
             save_path = os.path.join(UPLOAD_FOLDER, filename)
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
@@ -357,40 +507,33 @@ def add_hinh_anh_san_pham(
 
             hinh_anh_path = f"/{save_path.replace(os.sep, '/')}"
 
-        # Kết nối và insert DB
-        conn = db.connect_to_database()
-        if not isinstance(conn, Error):
-            cursor = conn.cursor()
+            # Thêm vào DB
             sql = """
                 INSERT INTO HinhAnhSanPham (ma_san_pham, url_hinh_anh, thu_tu) 
                 VALUES (%s, %s, %s)
             """
-            adr = (ma_san_pham, hinh_anh_path, thu_tu)
-
-            cursor.execute(sql, adr)
+            cursor.execute(sql, (ma_san_pham, hinh_anh_path, thu_tu))
             conn.commit()
-            cursor.close()
-            conn.close()
-            return {"message": "Thêm hình ảnh sản phẩm thành công."}
-        else:
-            raise HTTPException(status_code=500, detail="Lỗi kết nối cơ sở dữ liệu")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Lỗi server: {str(e)}")
 
+            added_images.append({
+                "ma_san_pham": ma_san_pham,
+                "url_hinh_anh": hinh_anh_path,
+                "thu_tu": thu_tu
+            })
 
+            thu_tu += 1  # tăng thứ tự cho ảnh tiếp theo
 
-    conn = db.connect_to_database()
-    if not isinstance(conn, Error):
-        cursor = conn.cursor(dictionary=True)
-        sql = "SELECT * FROM HinhAnhSanPham WHERE ma_san_pham = %s ORDER BY thu_tu ASC"
-        cursor.execute(sql, (ma_san_pham,))
-        results = cursor.fetchall()
         cursor.close()
         conn.close()
-        return {"hinh_anh_san_pham": results}
-    else:
-        return {"message": "Lỗi kết nối cơ sở dữ liệu."}
 
+        return {
+            "message": f"Đã thêm {len(added_images)} hình ảnh thành công.",
+            "hinh_anh_san_pham": added_images
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi server: {str(e)}")
+    
 @app.post("/themTuyChonCombo")
 def add_tuy_chon_combo(
     ma_chi_tiet_combo: int,
