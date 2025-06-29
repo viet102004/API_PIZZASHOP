@@ -7,6 +7,7 @@ CREATE TABLE NguoiDung (
     mat_khau VARCHAR(255) NOT NULL,
     vai_tro VARCHAR(50) NOT NULL CHECK (vai_tro IN ('khach_hang', 'quan_tri_vien', 'bep', 'giao_hang', 'ho_tro', 'nhan_vien_cua_hang')),
     ho_ten VARCHAR(100),
+    ngay_sinh DATE,
     anh_dai_dien VARCHAR(255),
     ngay_tao DATETIME DEFAULT CURRENT_TIMESTAMP,
     ngay_cap_nhat DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -445,10 +446,27 @@ CREATE TABLE Banner (
 CREATE TABLE OTP(
     ma_otp BIGINT AUTO_INCREMENT PRIMARY KEY,
     ma_nguoi_dung BIGINT NOT NULL,
-    otp_code VARCHAR(10) NOT NULL,  -- SỬA: NVARCHAR -> VARCHAR
+    otp_code VARCHAR(10) NOT NULL, 
     loai_otp VARCHAR(50) NOT NULL CHECK (loai_otp IN ('reset_password', 'verify_email', 'verify_phone')),  -- SỬA: NVARCHAR -> VARCHAR
     ngay_tao DATETIME DEFAULT CURRENT_TIMESTAMP,  -- SỬA: GETDATE() -> CURRENT_TIMESTAMP
     het_han DATETIME NOT NULL,
     da_su_dung BOOLEAN DEFAULT FALSE,
+    FOREIGN KEY (ma_nguoi_dung) REFERENCES NguoiDung(ma_nguoi_dung) ON DELETE CASCADE
+);
+
+-- : Bảng thông tin giao hàng
+CREATE TABLE ThongTinGiaoHang (
+    ma_thong_tin_giao_hang BIGINT AUTO_INCREMENT PRIMARY KEY,
+    ma_nguoi_dung BIGINT NOT NULL,
+    ten_nguoi_nhan VARCHAR(100) NOT NULL,
+    so_dien_thoai_nguoi_nhan VARCHAR(15) NOT NULL,
+    so_duong VARCHAR(255) NOT NULL,
+    phuong_xa VARCHAR(100),
+    quan_huyen VARCHAR(100),
+    tinh_thanh_pho VARCHAR(100),
+    la_dia_chi_mac_dinh BOOLEAN DEFAULT FALSE,
+    ghi_chu TEXT,
+    ngay_tao DATETIME DEFAULT CURRENT_TIMESTAMP,
+    ngay_cap_nhat DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     FOREIGN KEY (ma_nguoi_dung) REFERENCES NguoiDung(ma_nguoi_dung) ON DELETE CASCADE
 );
