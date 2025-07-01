@@ -1,32 +1,473 @@
-from fastapi import File, UploadFile, FastAPI, HTTPException, Form, Path, Query
-import os, shutil
+from fastapi import File, UploadFile, FastAPI, HTTPException, Form, Path, Query, status
+import os, shutil, string, secrets, random, asyncio, logging, time
 from typing import Literal, Optional, List, Annotated
 from mysql.connector import Error
 import db
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
-from datetime import date, datetime
-import time
+from datetime import date, datetime, timedelta
 from fastapi_mail import FastMail, MessageSchema, ConnectionConfig
 from pydantic import BaseModel, EmailStr
-import string
-import random
-import asyncio
-import logging
+from enum import Enum
 
 
 app = FastAPI()
 
 UPLOAD_FOLDER = "uploads"
 
+urlApp =  "https://related-burro-selected.ngrok-free.app"
 
+class PaymentRequest(BaseModel):
+    so_tien: int
+    phuong_thuc: str  # "momo" hoặc "vnpay"
+    ma_don_hang: int
+
+@app.post("/tao-url-thanh-toan")
+def tao_url_thanh_toan(data: PaymentRequest):
+    # Giả lập URL thanh toán
+    if data.phuong_thuc == "momo":
+        url = f"https://momo.vn/thanh-toan-gia?amount={data.so_tien}&orderId={data.ma_don_hang}"
+    elif data.phuong_thuc == "vnpay":
+        url = f"https://sandbox.vnpayment.vn/paymentv2/vpcpay.html?vnp_Amount={data.so_tien}&vnp_TxnRef={data.ma_don_hang}"
+    else:
+        url = "https://example.com"
+
+    return {"url": url}
 
 # Cấu hình logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Pydantic models
+class DatHangRequest(BaseModel):
+    ma_nguoi_dung: int
+    ma_thong_tin_giao_hang: int  # Sử dụng thông tin giao hàng có sẵn
+    phuong_thuc_thanh_toan: str  # 'tien_mat', 'chuyen_khoan', 'the_tin_dung', 'vi_dien_tu'
+    ma_giam_gia: Optional[int] = None
+    ghi_chu: Optional[str] = None
+    thoi_gian_giao_du_kien: Optional[str] = None  # Format: 'YYYY-MM-DD HH:MM:SS'
+
+@app.get("/danhSachDonHang/{ma_nguoi_dung}")
+def danh_sach_don_hang(ma_nguoi_dung: int):
+    try:
+        conn = db.connect_to_database()
+        if isinstance(conn, Error):
+            raise HTTPException(status_code=500, detail="Lỗi kết nối CSDL")
+
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT 
+                dh.ma_don_hang,
+                dh.ngay_tao,
+                dh.tong_tien_cuoi_cung,
+                dh.trang_thai,
+                ttgh.ten_nguoi_nhan,
+                ttgh.so_duong, ttgh.phuong_xa, ttgh.quan_huyen, ttgh.tinh_thanh_pho
+            FROM DonHang dh
+            LEFT JOIN ThongTinGiaoHang ttgh ON dh.ma_thong_tin_giao_hang = ttgh.ma_thong_tin_giao_hang
+            WHERE dh.ma_nguoi_dung = %s
+            ORDER BY dh.ngay_tao DESC
+        """, (ma_nguoi_dung,))
+        orders = cursor.fetchall()
+
+        result = []
+        for order in orders:
+            # Lấy danh sách sản phẩm ngắn gọn
+            cursor.execute("""
+                SELECT 
+                    sp.ten_san_pham, c.ten_combo
+                FROM MatHangDonHang mhdh
+                LEFT JOIN SanPham sp ON mhdh.ma_san_pham = sp.ma_san_pham
+                LEFT JOIN Combo c ON mhdh.ma_combo = c.ma_combo
+                WHERE mhdh.ma_don_hang = %s
+            """, (order['ma_don_hang'],))
+            items = cursor.fetchall()
+            item_names = [x['ten_san_pham'] or x['ten_combo'] for x in items]
+
+            result.append({
+                "ma_don_hang": order["ma_don_hang"],
+                "order_time": order["ngay_tao"].strftime("%Y-%m-%d %H:%M"),
+                "total_price": f"{order['tong_tien_cuoi_cung']:,}đ",
+                "status": order["trang_thai"],
+                "store_name": f"Giao cho: {order['ten_nguoi_nhan']}",
+                "items": item_names
+            })
+
+        return result
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi server: {str(e)}")
+
+
+@app.get("/chiTietDonHang/{ma_don_hang}")
+def get_chi_tiet_don_hang(ma_don_hang: int):
+    try:
+        conn = db.connect_to_database()
+        if isinstance(conn, Error):
+            raise HTTPException(status_code=500, detail="Lỗi kết nối cơ sở dữ liệu")
+
+        cursor = conn.cursor(dictionary=True)
+
+        # === 1. Thông tin đơn hàng và giao hàng ===
+        cursor.execute("""
+            SELECT 
+                dh.*,
+                nd.ho_ten,
+                nd.email,
+                ttgh.ten_nguoi_nhan,
+                ttgh.so_dien_thoai_nguoi_nhan,
+                ttgh.so_duong,
+                ttgh.phuong_xa,
+                ttgh.quan_huyen,
+                ttgh.tinh_thanh_pho,
+                ttgh.ghi_chu AS ghi_chu_giao_hang,
+                mgv.ma_code AS ma_giam_gia_code
+            FROM DonHang dh
+            LEFT JOIN NguoiDung nd ON dh.ma_nguoi_dung = nd.ma_nguoi_dung
+            LEFT JOIN ThongTinGiaoHang ttgh ON dh.ma_thong_tin_giao_hang = ttgh.ma_thong_tin_giao_hang
+            LEFT JOIN MaGiamGia mgv ON dh.ma_giam_gia = mgv.ma_giam_gia
+            WHERE dh.ma_don_hang = %s
+        """, (ma_don_hang,))
+        don_hang = cursor.fetchone()
+
+        if not don_hang:
+            raise HTTPException(status_code=404, detail="Đơn hàng không tồn tại")
+
+        # === 2. Danh sách mặt hàng trong đơn ===
+        cursor.execute("""
+            SELECT 
+                mhdh.*,
+                sp.ten_san_pham,
+                sp.hinh_anh,
+                c.ten_combo,
+                c.hinh_anh AS hinh_anh_combo
+            FROM MatHangDonHang mhdh
+            LEFT JOIN SanPham sp ON mhdh.ma_san_pham = sp.ma_san_pham
+            LEFT JOIN Combo c ON mhdh.ma_combo = c.ma_combo
+            WHERE mhdh.ma_don_hang = %s
+        """, (ma_don_hang,))
+        mat_hang_list = cursor.fetchall()
+
+        # === 3. Lấy tùy chọn cho từng mặt hàng ===
+        for mh in mat_hang_list:
+            if mh["loai_mat_hang"] == "san_pham":
+                cursor.execute("""
+                    SELECT * FROM ChiTietTuyChonDonHang 
+                    WHERE ma_mat_hang_don_hang = %s
+                """, (mh['ma_mat_hang_don_hang'],))
+                mh["tuy_chon"] = cursor.fetchall()
+
+            elif mh["loai_mat_hang"] == "combo":
+                cursor.execute("""
+                    SELECT * FROM ChiTietComboDonHang 
+                    WHERE ma_mat_hang_don_hang = %s
+                """, (mh['ma_mat_hang_don_hang'],))
+                chi_tiet_combo = cursor.fetchall()
+
+                for ct in chi_tiet_combo:
+                    cursor.execute("""
+                        SELECT * FROM TuyChonComboDonHang 
+                        WHERE ma_chi_tiet_combo_don_hang = %s
+                    """, (ct['ma_chi_tiet'],))
+                    ct['tuy_chon'] = cursor.fetchall()
+
+                mh["chi_tiet_combo"] = chi_tiet_combo
+
+        cursor.close()
+        conn.close()
+
+        # === 4. Format kết quả trả về giống format chuẩn ===
+        dia_chi = ", ".join(filter(None, [
+            don_hang.get("so_duong"),
+            don_hang.get("phuong_xa"),
+            don_hang.get("quan_huyen"),
+            don_hang.get("tinh_thanh_pho")
+        ]))
+
+        return {
+            "don_hang": {
+                "ma_don_hang": don_hang["ma_don_hang"],
+                "tong_tien_san_pham": don_hang["tong_tien_san_pham"],
+                "phi_giao_hang": don_hang["phi_giao_hang"],
+                "giam_gia_ma_giam_gia": don_hang.get("giam_gia_ma_giam_gia", 0),
+                "tong_tien_cuoi_cung": don_hang["tong_tien_cuoi_cung"],
+                "trang_thai": don_hang["trang_thai"],
+                "phuong_thuc_thanh_toan": don_hang["phuong_thuc_thanh_toan"],
+                "trang_thai_thanh_toan": don_hang["trang_thai_thanh_toan"],
+                "ghi_chu": don_hang.get("ghi_chu"),
+                "thoi_gian_giao_du_kien": don_hang.get("thoi_gian_giao_du_kien"),
+                "thong_tin_giao_hang": {
+                    "ten_nguoi_nhan": don_hang["ten_nguoi_nhan"],
+                    "so_dien_thoai": don_hang["so_dien_thoai_nguoi_nhan"],
+                    "dia_chi": dia_chi,
+                    "ghi_chu": don_hang.get("ghi_chu_giao_hang")
+                },
+                "nguoi_dat": {
+                    "ho_ten": don_hang.get("ho_ten"),
+                    "email": don_hang.get("email")
+                },
+                "ma_giam_gia": don_hang.get("ma_giam_gia_code")
+            },
+            "mat_hang": mat_hang_list
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi server: {str(e)}")
+
+
+@app.post("/datHang")
+def dat_hang(request: DatHangRequest):
+    try:
+        conn = db.connect_to_database()
+        if isinstance(conn, Error):
+            raise HTTPException(status_code=500, detail="Lỗi kết nối cơ sở dữ liệu")
+        cursor = conn.cursor(dictionary=True)
+
+        # === 1. Kiểm tra thông tin người dùng và giao hàng ===
+        cursor.execute("SELECT ma_nguoi_dung FROM NguoiDung WHERE ma_nguoi_dung = %s", (request.ma_nguoi_dung,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Người dùng không tồn tại")
+
+        cursor.execute("""
+            SELECT * FROM ThongTinGiaoHang 
+            WHERE ma_thong_tin_giao_hang = %s AND ma_nguoi_dung = %s
+        """, (request.ma_thong_tin_giao_hang, request.ma_nguoi_dung))
+        thong_tin_giao_hang = cursor.fetchone()
+        if not thong_tin_giao_hang:
+            raise HTTPException(status_code=404, detail="Thông tin giao hàng không tồn tại")
+
+        # === 2. Lấy giỏ hàng và mặt hàng ===
+        cursor.execute("SELECT ma_gio_hang FROM GioHang WHERE ma_nguoi_dung = %s", (request.ma_nguoi_dung,))
+        gio_hang = cursor.fetchone()
+        if not gio_hang:
+            raise HTTPException(status_code=400, detail="Giỏ hàng trống")
+        ma_gio_hang = gio_hang['ma_gio_hang']
+
+        cursor.execute("""
+            SELECT mhgh.*, sp.ten_san_pham, c.ten_combo 
+            FROM MatHangGioHang mhgh
+            LEFT JOIN SanPham sp ON mhgh.ma_san_pham = sp.ma_san_pham
+            LEFT JOIN Combo c ON mhgh.ma_combo = c.ma_combo
+            WHERE mhgh.ma_gio_hang = %s
+        """, (ma_gio_hang,))
+        mat_hang_list = cursor.fetchall()
+        if not mat_hang_list:
+            raise HTTPException(status_code=400, detail="Giỏ hàng trống")
+
+        # === 3. Tính tổng tiền ===
+        tong_tien_san_pham, chi_tiet_don_hang = 0, []
+        for mh in mat_hang_list:
+            tong_tuy_chon = 0
+
+            if mh['loai_mat_hang'] == 'san_pham':
+                cursor.execute("""
+                    SELECT gia_them FROM ChiTietTuyChonGioHang 
+                    WHERE ma_mat_hang_gio_hang = %s
+                """, (mh['ma_mat_hang_gio_hang'],))
+                tong_tuy_chon = sum(tc['gia_them'] for tc in cursor.fetchall())
+
+            elif mh['loai_mat_hang'] == 'combo':
+                cursor.execute("""
+                    SELECT SUM(tccgh.gia_them) AS tong_gia_tuy_chon
+                    FROM TuyChonComboGioHang tccgh
+                    JOIN ChiTietComboGioHang ctcgh ON tccgh.ma_chi_tiet_combo_gio_hang = ctcgh.ma_chi_tiet
+                    WHERE ctcgh.ma_mat_hang_gio_hang = %s
+                """, (mh['ma_mat_hang_gio_hang'],))
+                tong_tuy_chon = cursor.fetchone()['tong_gia_tuy_chon'] or 0
+
+            thanh_tien = (mh['gia_san_pham'] + tong_tuy_chon) * mh['so_luong']
+            tong_tien_san_pham += thanh_tien
+            chi_tiet_don_hang.append({'mat_hang': mh, 'tong_gia_tuy_chon': tong_tuy_chon, 'thanh_tien': thanh_tien})
+
+        # === 4. Mã giảm giá ===
+        giam_gia = 0
+        if request.ma_giam_gia:
+            cursor.execute("""
+                SELECT * FROM MaGiamGia WHERE ma_giam_gia = %s
+            """, (request.ma_giam_gia,))
+            mg = cursor.fetchone()
+            if not mg or not mg['hoat_dong']:
+                raise HTTPException(status_code=400, detail="Mã giảm giá không hợp lệ hoặc đã hết hiệu lực")
+
+            now = datetime.now().date()
+            if now < mg['ngay_bat_dau'] or now > mg['ngay_ket_thuc']:
+                raise HTTPException(status_code=400, detail="Mã giảm giá không còn hiệu lực")
+
+            if mg['gia_tri_don_hang_toi_thieu'] and tong_tien_san_pham < mg['gia_tri_don_hang_toi_thieu']:
+                raise HTTPException(status_code=400, detail="Không đủ điều kiện sử dụng mã giảm giá")
+
+            if mg['so_lan_su_dung_toi_da'] and mg['da_su_dung'] >= mg['so_lan_su_dung_toi_da']:
+                raise HTTPException(status_code=400, detail="Mã giảm giá đã hết lượt sử dụng")
+
+            if mg['loai_giam_gia'] == 'phan_tram':
+                giam_gia = tong_tien_san_pham * mg['gia_tri_giam'] / 100
+            else:
+                giam_gia = mg['gia_tri_giam']
+            giam_gia = min(giam_gia, tong_tien_san_pham)
+
+        # === 5. Tổng tiền cuối cùng ===
+        phi_giao_hang = 30000
+        tong_tien_cuoi_cung = tong_tien_san_pham + phi_giao_hang - giam_gia
+
+        # === 6. Tạo đơn hàng ===
+        cursor.execute("""
+            INSERT INTO DonHang (
+                ma_thong_tin_giao_hang, ma_nguoi_dung, tong_tien_san_pham, phi_giao_hang,
+                giam_gia_ma_giam_gia, giam_gia_combo, tong_tien_cuoi_cung,
+                trang_thai, phuong_thuc_thanh_toan, trang_thai_thanh_toan,
+                ma_giam_gia, ghi_chu, thoi_gian_giao_du_kien
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, 'da_nhan', %s, 'cho_xu_ly', %s, %s, %s)
+        """, (
+            request.ma_thong_tin_giao_hang, request.ma_nguoi_dung, tong_tien_san_pham, phi_giao_hang,
+            giam_gia, 0, tong_tien_cuoi_cung,
+            request.phuong_thuc_thanh_toan, request.ma_giam_gia, request.ghi_chu, request.thoi_gian_giao_du_kien
+        ))
+        ma_don_hang = cursor.lastrowid
+
+        # === 7. Chuyển mặt hàng từ giỏ hàng sang đơn hàng + tùy chọn ===
+        for ct in chi_tiet_don_hang:
+            mh = ct['mat_hang']
+            cursor.execute("""
+                INSERT INTO MatHangDonHang (
+                    ma_don_hang, ma_san_pham, ma_combo, loai_mat_hang,
+                    so_luong, don_gia_co_ban, tong_gia_tuy_chon, thanh_tien, ghi_chu
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                ma_don_hang, mh['ma_san_pham'], mh['ma_combo'], mh['loai_mat_hang'],
+                mh['so_luong'], mh['gia_san_pham'], ct['tong_gia_tuy_chon'], ct['thanh_tien'], mh['ghi_chu']
+            ))
+            ma_mh_dh = cursor.lastrowid
+
+            if mh['loai_mat_hang'] == 'san_pham':
+                cursor.execute("""
+                    SELECT cttcgh.*, gtc.ten_gia_tri, ltc.ten_loai
+                    FROM ChiTietTuyChonGioHang cttcgh
+                    JOIN GiaTriTuyChon gtc ON cttcgh.ma_gia_tri = gtc.ma_gia_tri
+                    JOIN LoaiTuyChon ltc ON gtc.ma_loai_tuy_chon = ltc.ma_loai_tuy_chon
+                    WHERE cttcgh.ma_mat_hang_gio_hang = %s
+                """, (mh['ma_mat_hang_gio_hang'],))
+                for row in cursor.fetchall():
+                    cursor.execute("""
+                        INSERT INTO ChiTietTuyChonDonHang (
+                            ma_mat_hang_don_hang, ma_gia_tri, ten_loai_tuy_chon, ten_gia_tri, gia_them
+                        ) VALUES (%s, %s, %s, %s, %s)
+                    """, (ma_mh_dh, row['ma_gia_tri'], row['ten_loai'], row['ten_gia_tri'], row['gia_them']))
+
+            elif mh['loai_mat_hang'] == 'combo':
+                # Lấy chi tiết combo
+                cursor.execute("""
+                    SELECT ctcgh.*, ctc.ten_san_pham, ctc.ma_san_pham, ctc.gia_san_pham
+                    FROM ChiTietComboGioHang ctcgh
+                    JOIN ChiTietCombo ctc ON ctcgh.ma_chi_tiet_combo = ctc.ma_chi_tiet_combo
+                    WHERE ctcgh.ma_mat_hang_gio_hang = %s
+                """, (mh['ma_mat_hang_gio_hang'],))
+                for ctc in cursor.fetchall():
+                    cursor.execute("""
+                        INSERT INTO ChiTietComboDonHang (
+                            ma_mat_hang_don_hang, ma_san_pham, ten_san_pham, so_luong, don_gia
+                        ) VALUES (%s, %s, %s, %s, %s)
+                    """, (ma_mh_dh, ctc['ma_san_pham'], ctc['ten_san_pham'], ctc['so_luong'], ctc['gia_san_pham']))
+                    ma_ctc_dh = cursor.lastrowid
+
+                    # Tùy chọn cho combo
+                    cursor.execute("""
+                        SELECT tccgh.*, gtc.ten_gia_tri, ltc.ten_loai
+                        FROM TuyChonComboGioHang tccgh
+                        JOIN GiaTriTuyChon gtc ON tccgh.ma_gia_tri = gtc.ma_gia_tri
+                        JOIN LoaiTuyChon ltc ON gtc.ma_loai_tuy_chon = ltc.ma_loai_tuy_chon
+                        WHERE tccgh.ma_chi_tiet_combo_gio_hang = %s
+                    """, (ctc['ma_chi_tiet'],))
+                    for tcc in cursor.fetchall():
+                        cursor.execute("""
+                            INSERT INTO TuyChonComboDonHang (
+                                ma_chi_tiet_combo_don_hang, ma_gia_tri, ten_loai_tuy_chon, ten_gia_tri, gia_them
+                            ) VALUES (%s, %s, %s, %s, %s)
+                        """, (ma_ctc_dh, tcc['ma_gia_tri'], tcc['ten_loai'], tcc['ten_gia_tri'], tcc['gia_them']))
+
+        # === 8. Cập nhật mã giảm giá + xóa giỏ hàng + tạo giao dịch ===
+        if request.ma_giam_gia:
+            cursor.execute("UPDATE MaGiamGia SET da_su_dung = da_su_dung + 1 WHERE ma_giam_gia = %s", (request.ma_giam_gia,))
+        cursor.execute("DELETE FROM MatHangGioHang WHERE ma_gio_hang = %s", (ma_gio_hang,))
+        cursor.execute("""
+            INSERT INTO GiaoDich (ma_nguoi_dung, loai_giao_dich, so_tien, trang_thai, phuong_thuc_thanh_toan)
+            VALUES (%s, 'thanh_toan_don_hang', %s, 'cho_xu_ly', %s)
+        """, (request.ma_nguoi_dung, tong_tien_cuoi_cung, request.phuong_thuc_thanh_toan))
+
+        # === Hoàn tất ===
+        conn.commit()
+        return {
+            "message": "Đặt hàng thành công",
+            "ma_don_hang": ma_don_hang,
+            "tong_tien_san_pham": tong_tien_san_pham,
+            "phi_giao_hang": phi_giao_hang,
+            "giam_gia_ma_giam_gia": giam_gia,
+            "tong_tien_cuoi_cung": tong_tien_cuoi_cung,
+            "thong_tin_giao_hang": {
+                "ten_nguoi_nhan": thong_tin_giao_hang['ten_nguoi_nhan'],
+                "so_dien_thoai": thong_tin_giao_hang['so_dien_thoai_nguoi_nhan'],
+                "dia_chi": f"{thong_tin_giao_hang['so_duong']}, {thong_tin_giao_hang['phuong_xa']}, {thong_tin_giao_hang['quan_huyen']}, {thong_tin_giao_hang['tinh_thanh_pho']}"
+            }
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Lỗi server: {str(e)}")
+
+@app.get("/tatCaDonHang")
+def lay_tat_ca_don_hang():
+    try:
+        conn = db.connect_to_database()
+        if isinstance(conn, Error):
+            raise HTTPException(status_code=500, detail="Lỗi kết nối cơ sở dữ liệu")
+        cursor = conn.cursor(dictionary=True)
+
+        # === 1. Lấy tất cả đơn hàng và thông tin giao hàng liên quan ===
+        cursor.execute("""
+            SELECT dh.*, tgh.ten_nguoi_nhan, tgh.so_dien_thoai_nguoi_nhan,
+                   tgh.so_duong, tgh.phuong_xa, tgh.quan_huyen, tgh.tinh_thanh_pho
+            FROM DonHang dh
+            JOIN ThongTinGiaoHang tgh ON dh.ma_thong_tin_giao_hang = tgh.ma_thong_tin_giao_hang
+            ORDER BY dh.ma_don_hang DESC
+        """)
+        don_hang_list = cursor.fetchall()
+
+        ket_qua = []
+        for dh in don_hang_list:
+            dia_chi = ", ".join(filter(None, [
+                dh.get("so_duong"), dh.get("phuong_xa"),
+                dh.get("quan_huyen"), dh.get("tinh_thanh_pho")
+            ]))
+
+            ket_qua.append({
+                "message": "Lấy đơn hàng thành công",
+                "ma_don_hang": dh["ma_don_hang"],
+                "tong_tien_san_pham": dh["tong_tien_san_pham"],
+                "phi_giao_hang": dh["phi_giao_hang"],
+                "giam_gia_ma_giam_gia": dh.get("giam_gia_ma_giam_gia", 0),
+                "tong_tien_cuoi_cung": dh["tong_tien_cuoi_cung"],
+                "thoi_gian_giao_du_kien": dh.get("thoi_gian_giao_du_kien"),
+                "phuong_thuc_thanh_toan": dh["phuong_thuc_thanh_toan"],
+                "ghi_chu": dh.get("ghi_chu"),
+                "trang_thai": dh["trang_thai"],
+                "trang_thai_thanh_toan": dh["trang_thai_thanh_toan"],
+                "thong_tin_giao_hang": {
+                    "ten_nguoi_nhan": dh["ten_nguoi_nhan"],
+                    "so_dien_thoai": dh["so_dien_thoai_nguoi_nhan"],
+                    "dia_chi": dia_chi
+                }
+            })
+
+        return {"don_hang": ket_qua}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi server: {str(e)}")
+
+class TrangThaiEnum(str, Enum):
+    HOAT_DONG = "hoat_dong"
+    KHONG_DUNG = "khong_dung"
+
 class ThongTinGiaoHangCreate(BaseModel):
     ten_nguoi_nhan: str
     so_dien_thoai_nguoi_nhan: str
@@ -36,6 +477,7 @@ class ThongTinGiaoHangCreate(BaseModel):
     tinh_thanh_pho: Optional[str] = None
     la_dia_chi_mac_dinh: bool = False
     ghi_chu: Optional[str] = None
+    trang_thai: TrangThaiEnum = TrangThaiEnum.HOAT_DONG
 
 class ThongTinGiaoHangUpdate(BaseModel):
     ten_nguoi_nhan: Optional[str] = None
@@ -46,6 +488,7 @@ class ThongTinGiaoHangUpdate(BaseModel):
     tinh_thanh_pho: Optional[str] = None
     la_dia_chi_mac_dinh: Optional[bool] = None
     ghi_chu: Optional[str] = None
+    trang_thai: Optional[TrangThaiEnum] = None
 
 class ThongTinGiaoHangResponse(BaseModel):
     ma_thong_tin_giao_hang: int
@@ -58,6 +501,7 @@ class ThongTinGiaoHangResponse(BaseModel):
     tinh_thanh_pho: Optional[str]
     la_dia_chi_mac_dinh: bool
     ghi_chu: Optional[str]
+    trang_thai: TrangThaiEnum
     ngay_tao: str
     ngay_cap_nhat: str
 
@@ -91,12 +535,12 @@ def create_delivery_address(
                 (ma_nguoi_dung,)
             )
         
-        # Thêm địa chỉ mới
+        # Thêm địa chỉ mới (bao gồm cột trang_thai)
         insert_query = """
         INSERT INTO ThongTinGiaoHang 
         (ma_nguoi_dung, ten_nguoi_nhan, so_dien_thoai_nguoi_nhan, so_duong, 
-         phuong_xa, quan_huyen, tinh_thanh_pho, la_dia_chi_mac_dinh, ghi_chu)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+         phuong_xa, quan_huyen, tinh_thanh_pho, la_dia_chi_mac_dinh, ghi_chu, trang_thai)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
         
         cursor.execute(insert_query, (
@@ -108,7 +552,8 @@ def create_delivery_address(
             address_data.quan_huyen,
             address_data.tinh_thanh_pho,
             address_data.la_dia_chi_mac_dinh,
-            address_data.ghi_chu
+            address_data.ghi_chu,
+            address_data.trang_thai.value
         ))
         
         address_id = cursor.lastrowid
@@ -138,7 +583,7 @@ def create_delivery_address(
             conn.close()
 
 @app.get("/users/{ma_nguoi_dung}/delivery-addresses")
-def get_delivery_addresses(ma_nguoi_dung: int):
+def get_delivery_addresses(ma_nguoi_dung: int, chi_lay_hoat_dong: bool = True):
     """
     Lấy danh sách địa chỉ giao hàng của người dùng
     """
@@ -157,12 +602,19 @@ def get_delivery_addresses(ma_nguoi_dung: int):
                 detail="Người dùng không tồn tại"
             )
         
-        # Lấy danh sách địa chỉ
-        cursor.execute("""
-            SELECT * FROM ThongTinGiaoHang 
-            WHERE ma_nguoi_dung = %s 
-            ORDER BY la_dia_chi_mac_dinh DESC, ngay_cap_nhat DESC
-        """, (ma_nguoi_dung,))
+        # Lấy danh sách địa chỉ (có thể lọc theo trạng thái)
+        if chi_lay_hoat_dong:
+            cursor.execute("""
+                SELECT * FROM ThongTinGiaoHang 
+                WHERE ma_nguoi_dung = %s AND trang_thai = 'hoat_dong'
+                ORDER BY la_dia_chi_mac_dinh DESC, ngay_cap_nhat DESC
+            """, (ma_nguoi_dung,))
+        else:
+            cursor.execute("""
+                SELECT * FROM ThongTinGiaoHang 
+                WHERE ma_nguoi_dung = %s 
+                ORDER BY la_dia_chi_mac_dinh DESC, ngay_cap_nhat DESC
+            """, (ma_nguoi_dung,))
         
         addresses = cursor.fetchall()
         
@@ -293,6 +745,10 @@ def update_delivery_address(
             update_fields['ghi_chu'] = '%s'
             update_values.append(address_data.ghi_chu)
             
+        if address_data.trang_thai is not None:
+            update_fields['trang_thai'] = '%s'
+            update_values.append(address_data.trang_thai.value)
+            
         if address_data.la_dia_chi_mac_dinh is not None:
             update_fields['la_dia_chi_mac_dinh'] = '%s'
             update_values.append(address_data.la_dia_chi_mac_dinh)
@@ -350,7 +806,7 @@ def update_delivery_address(
 @app.delete("/users/{ma_nguoi_dung}/delivery-addresses/{ma_thong_tin_giao_hang}")
 def delete_delivery_address(ma_nguoi_dung: int, ma_thong_tin_giao_hang: int):
     """
-    Xóa địa chỉ giao hàng
+    Xóa địa chỉ giao hàng (soft delete - chuyển trạng thái thành 'khong_dung')
     """
     conn = None
     cursor = None
@@ -372,24 +828,19 @@ def delete_delivery_address(ma_nguoi_dung: int, ma_thong_tin_giao_hang: int):
                 detail="Không tìm thấy địa chỉ giao hàng"
             )
         
-        # Kiểm tra xem địa chỉ này có đang được sử dụng trong đơn hàng nào không
-        cursor.execute("""
-            SELECT COUNT(*) as count FROM DonHang 
-            WHERE ma_nguoi_dung = %s AND dia_chi_giao_hang LIKE %s
-        """, (ma_nguoi_dung, f"%{address['so_duong']}%"))
-        
-        result = cursor.fetchone()
-        if result['count'] > 0:
+        # Kiểm tra xem địa chỉ đã ở trạng thái 'khong_dung' chưa
+        if address['trang_thai'] == TrangThaiEnum.KHONG_DUNG:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Không thể xóa địa chỉ đang được sử dụng trong đơn hàng"
+                detail="Địa chỉ giao hàng đã được xóa trước đó"
             )
         
-        # Xóa địa chỉ
+        # Luôn thực hiện soft delete - chuyển trạng thái thành 'khong_dung'
         cursor.execute("""
-            DELETE FROM ThongTinGiaoHang 
+            UPDATE ThongTinGiaoHang 
+            SET trang_thai = %s, la_dia_chi_mac_dinh = FALSE, ngay_cap_nhat = NOW()
             WHERE ma_thong_tin_giao_hang = %s AND ma_nguoi_dung = %s
-        """, (ma_thong_tin_giao_hang, ma_nguoi_dung))
+        """, (TrangThaiEnum.KHONG_DUNG, ma_thong_tin_giao_hang, ma_nguoi_dung))
         
         conn.commit()
         
@@ -397,16 +848,16 @@ def delete_delivery_address(ma_nguoi_dung: int, ma_thong_tin_giao_hang: int):
         if address['la_dia_chi_mac_dinh']:
             cursor.execute("""
                 SELECT ma_thong_tin_giao_hang FROM ThongTinGiaoHang 
-                WHERE ma_nguoi_dung = %s 
+                WHERE ma_nguoi_dung = %s AND trang_thai = %s
                 ORDER BY ngay_cap_nhat DESC 
                 LIMIT 1
-            """, (ma_nguoi_dung,))
+            """, (ma_nguoi_dung, TrangThaiEnum.HOAT_DONG))
             
             next_default = cursor.fetchone()
             if next_default:
                 cursor.execute("""
                     UPDATE ThongTinGiaoHang 
-                    SET la_dia_chi_mac_dinh = TRUE 
+                    SET la_dia_chi_mac_dinh = TRUE, ngay_cap_nhat = NOW()
                     WHERE ma_thong_tin_giao_hang = %s
                 """, (next_default['ma_thong_tin_giao_hang'],))
                 conn.commit()
@@ -416,7 +867,8 @@ def delete_delivery_address(ma_nguoi_dung: int, ma_thong_tin_giao_hang: int):
             "message": "Xóa địa chỉ giao hàng thành công",
             "data": {
                 "ma_thong_tin_giao_hang": ma_thong_tin_giao_hang,
-                "ma_nguoi_dung": ma_nguoi_dung
+                "ma_nguoi_dung": ma_nguoi_dung,
+                "trang_thai": TrangThaiEnum.KHONG_DUNG
             }
         }
         
@@ -437,7 +889,7 @@ def delete_delivery_address(ma_nguoi_dung: int, ma_thong_tin_giao_hang: int):
 @app.patch("/users/{ma_nguoi_dung}/delivery-addresses/{ma_thong_tin_giao_hang}/set-default")
 def set_default_delivery_address(ma_nguoi_dung: int, ma_thong_tin_giao_hang: int):
     """
-    Đặt địa chỉ giao hàng làm mặc định
+    Đặt địa chỉ giao hàng làm mặc định (chỉ với địa chỉ đang hoạt động)
     """
     conn = None
     cursor = None
@@ -446,17 +898,17 @@ def set_default_delivery_address(ma_nguoi_dung: int, ma_thong_tin_giao_hang: int
         conn = db.connect_to_database()
         cursor = conn.cursor(dictionary=True)
         
-        # Kiểm tra địa chỉ có tồn tại và thuộc về người dùng không
+        # Kiểm tra địa chỉ có tồn tại, thuộc về người dùng và đang hoạt động không
         cursor.execute("""
             SELECT * FROM ThongTinGiaoHang 
-            WHERE ma_thong_tin_giao_hang = %s AND ma_nguoi_dung = %s
+            WHERE ma_thong_tin_giao_hang = %s AND ma_nguoi_dung = %s AND trang_thai = 'hoat_dong'
         """, (ma_thong_tin_giao_hang, ma_nguoi_dung))
         
         address = cursor.fetchone()
         if not address:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail="Không tìm thấy địa chỉ giao hàng"
+                detail="Không tìm thấy địa chỉ giao hàng hoạt động"
             )
         
         # Bỏ mặc định tất cả địa chỉ khác
@@ -498,6 +950,7 @@ def set_default_delivery_address(ma_nguoi_dung: int, ma_thong_tin_giao_hang: int
         if conn:
             conn.close()
 
+
 conf = ConnectionConfig(
     MAIL_USERNAME="vviethhoang@gmail.com",
     MAIL_PASSWORD="svmf gjrv lwft yvqr",
@@ -514,15 +967,55 @@ def generate_password(length=8):
     chars = string.ascii_letters + string.digits
     return ''.join(random.choices(chars, k=length))
 
-async def send_email(to_email: str, password: str):
+def generate_activation_token():
+    """Tạo token để kích hoạt mật khẩu mới"""
+    return secrets.token_urlsafe(32)
+
+async def send_email_with_password_and_link(to_email: str, new_password: str, activation_token: str):
+    # URL để kích hoạt mật khẩu
+    activation_url = f"{urlApp}/kich-hoat-mat-khau?token={activation_token}"
+    
     message = MessageSchema(
-        subject="Mật khẩu mới từ Pizza App",
+        subject="Mật khẩu mới từ Pizza App - Cần kích hoạt",
         recipients=[to_email],
         body=f"""
-            <p>Chào bạn,</p>
-            <p>Mật khẩu mới của bạn là: <strong>{password}</strong></p>
-            <p>Vui lòng đăng nhập và đổi lại mật khẩu nếu cần.</p>
-            <p>-- Pizza App Team --</p>
+            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+                <h2 style="color: #d32f2f;">Pizza App - Mật khẩu mới</h2>
+                <p>Chào bạn,</p>
+                <p>Mật khẩu mới của bạn là:</p>
+                
+                <div style="background-color: #f5f5f5; padding: 15px; border-radius: 5px; text-align: center; margin: 20px 0;">
+                    <h3 style="color: #d32f2f; margin: 0;">{new_password}</h3>
+                </div>
+                
+                <div style="background-color: #fff3cd; padding: 15px; border-radius: 5px; border-left: 4px solid #ffc107; margin: 20px 0;">
+                    <strong>⚠️ Quan trọng:</strong> Mật khẩu này chưa có hiệu lực. 
+                    Bạn cần nhấn vào nút bên dưới để kích hoạt mật khẩu mới.
+                </div>
+                
+                <div style="text-align: center; margin: 30px 0;">
+                    <a href="{activation_url}" 
+                       style="background-color: #28a745; color: white; padding: 15px 30px; 
+                              text-decoration: none; border-radius: 5px; display: inline-block; font-weight: bold;">
+                        Kích hoạt mật khẩu mới
+                    </a>
+                </div>
+                
+                <p>Hoặc copy link sau vào trình duyệt của bạn:</p>
+                <p style="background-color: #f5f5f5; padding: 10px; border-radius: 5px; word-break: break-all;">
+                    {activation_url}
+                </p>
+                
+                <p><strong>Lưu ý:</strong></p>
+                <ul>
+                    <li>Link kích hoạt này chỉ có hiệu lực trong vòng 24 giờ</li>
+                    <li>Sau khi kích hoạt, bạn có thể đăng nhập bằng mật khẩu mới</li>
+                    <li>Mật khẩu cũ vẫn có hiệu lực cho đến khi bạn kích hoạt mật khẩu mới</li>
+                </ul>
+                
+                <p>Trân trọng,<br>
+                <strong>Pizza App Team</strong></p>
+            </div>
         """,
         subtype="html"
     )
@@ -534,468 +1027,767 @@ async def quen_mat_khau(email: EmailStr = Form(...)):
     conn = db.connect_to_database()
     cursor = conn.cursor(dictionary=True)
 
+    # Kiểm tra email có tồn tại không
     cursor.execute("SELECT * FROM NguoiDung WHERE email = %s", (email,))
     user = cursor.fetchone()
     if not user:
         raise HTTPException(status_code=404, detail="Email không tồn tại")
 
+    # Tạo mật khẩu mới và token kích hoạt
     new_password = generate_password()
+    activation_token = generate_activation_token()
+    expires_at = datetime.now() + timedelta(hours=24)  # Token có hiệu lực 24 giờ
 
-    cursor.execute("UPDATE NguoiDung SET mat_khau = %s WHERE email = %s", (new_password, email))
+    # Lưu thông tin vào bảng pending_password_changes
+    cursor.execute("""
+        INSERT INTO pending_password_changes (email, new_password, activation_token, expires_at, created_at, activated) 
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE 
+        new_password = VALUES(new_password),
+        activation_token = VALUES(activation_token), 
+        expires_at = VALUES(expires_at), 
+        created_at = VALUES(created_at),
+        activated = 0
+    """, (email, new_password, activation_token, expires_at, datetime.now(), False))
+    
     conn.commit()
 
-    await send_email(email, new_password)
+    # Gửi email với mật khẩu mới và link kích hoạt
+    await send_email_with_password_and_link(email, new_password, activation_token)
 
-    return {"message": "Mật khẩu mới đã được gửi về email của bạn"}
+    return {"message": "Mật khẩu mới đã được gửi về email của bạn. Vui lòng kiểm tra email và nhấn link để kích hoạt mật khẩu."}
 
-class DatHangRequest(BaseModel):
-    ma_nguoi_dung: int
-    ma_cua_hang: Optional[int] = None
-    dia_chi_giao_hang: str
-    so_dien_thoai_giao_hang: str
-    phuong_thuc_thanh_toan: str  # 'tien_mat', 'chuyen_khoan', 'the_tin_dung', 'vi_dien_tu'
-    ma_giam_gia: Optional[int] = None
-    ghi_chu: Optional[str] = None
-    thoi_gian_giao_du_kien: Optional[str] = None  # Format: 'YYYY-MM-DD HH:MM:SS'
+@app.get("/kich-hoat-mat-khau")
+async def kich_hoat_mat_khau(token: str):
+    conn = db.connect_to_database()
+    cursor = conn.cursor(dictionary=True)
 
-@app.post("/datHang")
-def dat_hang(request: DatHangRequest):
-    """Đặt hàng từ giỏ hàng"""
     try:
-        conn = db.connect_to_database()
-        if isinstance(conn, Error):
-            raise HTTPException(status_code=500, detail="Lỗi kết nối cơ sở dữ liệu")
-
-        cursor = conn.cursor(dictionary=True)
-
-        # 1. Kiểm tra người dùng tồn tại
-        cursor.execute("SELECT ma_nguoi_dung FROM NguoiDung WHERE ma_nguoi_dung = %s", 
-                      (request.ma_nguoi_dung,))
-        if not cursor.fetchone():
-            raise HTTPException(status_code=404, detail="Người dùng không tồn tại")
-
-        # 2. Lấy giỏ hàng
-        cursor.execute("SELECT ma_gio_hang FROM GioHang WHERE ma_nguoi_dung = %s", 
-                      (request.ma_nguoi_dung,))
-        gio_hang = cursor.fetchone()
-        
-        if not gio_hang:
-            raise HTTPException(status_code=404, detail="Giỏ hàng trống")
-
-        ma_gio_hang = gio_hang['ma_gio_hang']
-
-        # 3. Lấy các mặt hàng trong giỏ
+        # Kiểm tra token có hợp lệ không
         cursor.execute("""
-            SELECT 
-                mhgh.ma_mat_hang_gio_hang,
-                mhgh.ma_san_pham,
-                mhgh.ma_combo,
-                mhgh.loai_mat_hang,
-                mhgh.so_luong,
-                mhgh.gia_san_pham,
-                mhgh.ghi_chu,
-                sp.ten_san_pham,
-                c.ten_combo
-            FROM MatHangGioHang mhgh
-            LEFT JOIN SanPham sp ON mhgh.ma_san_pham = sp.ma_san_pham
-            LEFT JOIN Combo c ON mhgh.ma_combo = c.ma_combo
-            WHERE mhgh.ma_gio_hang = %s
-        """, (ma_gio_hang,))
+            SELECT * FROM pending_password_changes 
+            WHERE activation_token = %s AND expires_at > %s AND activated = 0
+        """, (token, datetime.now()))
         
-        mat_hang_list = cursor.fetchall()
+        pending_change = cursor.fetchone()
+        if not pending_change:
+            # Token không hợp lệ hoặc đã hết hạn
+            return HTMLResponse(content="""
+            <!DOCTYPE html>
+            <html lang="vi">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>Kích hoạt thất bại - Pizza App</title>
+                <style>
+                    body {
+                        font-family: Arial, sans-serif;
+                        background-color: #f5f5f5;
+                        margin: 0;
+                        padding: 20px;
+                        display: flex;
+                        justify-content: center;
+                        align-items: center;
+                        min-height: 100vh;
+                    }
+                    .container {
+                        background: white;
+                        padding: 30px;
+                        border-radius: 8px;
+                        box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+                        max-width: 400px;
+                        width: 100%;
+                        text-align: center;
+                    }
+                    h1 {
+                        color: #d32f2f;
+                        font-size: 24px;
+                        margin-bottom: 15px;
+                    }
+                    p {
+                        color: #666;
+                        font-size: 16px;
+                        line-height: 1.5;
+                        margin-bottom: 20px;
+                    }
+                    .btn {
+                        background-color: #d32f2f;
+                        color: white;
+                        padding: 12px 24px;
+                        border: none;
+                        border-radius: 4px;
+                        font-size: 16px;
+                        cursor: pointer;
+                        text-decoration: none;
+                        display: inline-block;
+                    }
+                    .btn:hover {
+                        background-color: #b71c1c;
+                    }
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <h1>❌ Kích hoạt thất bại</h1>
+                    <p>Link kích hoạt không hợp lệ hoặc đã hết hạn.<br>Vui lòng yêu cầu đặt lại mật khẩu mới.</p>
+                    <a href="https://related-burro-selected.ngrok-free.app" class="btn">Về trang chủ</a>
+                </div>
+            </body>
+            </html>
+            """, status_code=400)
+
+        # Cập nhật mật khẩu trong bảng NguoiDung
+        cursor.execute("UPDATE NguoiDung SET mat_khau = %s WHERE email = %s", 
+                       (pending_change['new_password'], pending_change['email']))
         
-        if not mat_hang_list:
-            raise HTTPException(status_code=400, detail="Giỏ hàng trống")
-
-        # 4. Tính toán giá tiền
-        tong_tien_san_pham = 0
-        chi_tiet_don_hang = []
-
-        for mat_hang in mat_hang_list:
-            tong_gia_tuy_chon = 0
-            
-            # Tính giá tùy chọn cho sản phẩm đơn lẻ
-            if mat_hang['loai_mat_hang'] == 'san_pham':
-                cursor.execute("""
-                    SELECT gia_them FROM ChiTietTuyChonGioHang 
-                    WHERE ma_mat_hang_gio_hang = %s
-                """, (mat_hang['ma_mat_hang_gio_hang'],))
-                
-                tuy_chon_list = cursor.fetchall()
-                tong_gia_tuy_chon = sum(tc['gia_them'] for tc in tuy_chon_list)
-            
-            # Tính giá tùy chọn cho combo
-            elif mat_hang['loai_mat_hang'] == 'combo':
-                cursor.execute("""
-                    SELECT SUM(tccgh.gia_them) as tong_gia_tuy_chon
-                    FROM TuyChonComboGioHang tccgh
-                    JOIN ChiTietComboGioHang ctcgh ON tccgh.ma_chi_tiet_combo_gio_hang = ctcgh.ma_chi_tiet
-                    WHERE ctcgh.ma_mat_hang_gio_hang = %s
-                """, (mat_hang['ma_mat_hang_gio_hang'],))
-                
-                result = cursor.fetchone()
-                tong_gia_tuy_chon = result['tong_gia_tuy_chon'] or 0
-
-            thanh_tien = (mat_hang['gia_san_pham'] + tong_gia_tuy_chon) * mat_hang['so_luong']
-            tong_tien_san_pham += thanh_tien
-            
-            chi_tiet_don_hang.append({
-                'mat_hang': mat_hang,
-                'tong_gia_tuy_chon': tong_gia_tuy_chon,
-                'thanh_tien': thanh_tien
-            })
-
-        # 5. Xử lý mã giảm giá
-        giam_gia_ma_giam_gia = 0
-        if request.ma_giam_gia:
-            cursor.execute("""
-                SELECT 
-                    loai_giam_gia,
-                    gia_tri_giam,
-                    gia_tri_don_hang_toi_thieu,
-                    so_lan_su_dung_toi_da,
-                    da_su_dung,
-                    ngay_bat_dau,
-                    ngay_ket_thuc,
-                    hoat_dong
-                FROM MaGiamGia 
-                WHERE ma_giam_gia = %s
-            """, (request.ma_giam_gia,))
-            
-            ma_giam_gia_info = cursor.fetchone()
-            
-            if not ma_giam_gia_info:
-                raise HTTPException(status_code=404, detail="Mã giảm giá không tồn tại")
-            
-            if not ma_giam_gia_info['hoat_dong']:
-                raise HTTPException(status_code=400, detail="Mã giảm giá đã hết hiệu lực")
-            
-            # Kiểm tra điều kiện áp dụng
-            if ma_giam_gia_info['gia_tri_don_hang_toi_thieu'] and tong_tien_san_pham < ma_giam_gia_info['gia_tri_don_hang_toi_thieu']:
-                raise HTTPException(status_code=400, detail=f"Đơn hàng tối thiểu {ma_giam_gia_info['gia_tri_don_hang_toi_thieu']} để áp dụng mã giảm giá")
-            
-            if ma_giam_gia_info['so_lan_su_dung_toi_da'] and ma_giam_gia_info['da_su_dung'] >= ma_giam_gia_info['so_lan_su_dung_toi_da']:
-                raise HTTPException(status_code=400, detail="Mã giảm giá đã hết lượt sử dụng")
-            
-            # Tính giảm giá
-            if ma_giam_gia_info['loai_giam_gia'] == 'phan_tram':
-                giam_gia_ma_giam_gia = tong_tien_san_pham * ma_giam_gia_info['gia_tri_giam'] / 100
-            else:  # 'co_dinh'
-                giam_gia_ma_giam_gia = ma_giam_gia_info['gia_tri_giam']
-            
-            # Giảm giá không được vượt quá tổng tiền sản phẩm
-            giam_gia_ma_giam_gia = min(giam_gia_ma_giam_gia, tong_tien_san_pham)
-
-        # 6. Tính phí giao hàng (có thể customize logic này)
-        phi_giao_hang = 30000  # Phí cố định 30k, có thể tính theo khoảng cách
+        # Đánh dấu đã kích hoạt
+        cursor.execute("UPDATE pending_password_changes SET activated = 1 WHERE activation_token = %s", (token,))
         
-        # 7. Tính tổng tiền cuối cùng
-        tong_tien_cuoi_cung = tong_tien_san_pham + phi_giao_hang - giam_gia_ma_giam_gia
-        
-        # 8. Tạo đơn hàng
-        cursor.execute("""
-            INSERT INTO DonHang (
-                ma_nguoi_dung, ma_cua_hang, tong_tien_san_pham, phi_giao_hang,
-                giam_gia_ma_giam_gia, giam_gia_combo, tong_tien_cuoi_cung,
-                trang_thai, dia_chi_giao_hang, so_dien_thoai_giao_hang,
-                phuong_thuc_thanh_toan, trang_thai_thanh_toan, ma_giam_gia,
-                ghi_chu, thoi_gian_giao_du_kien
-            ) VALUES (
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
-            )
-        """, (
-            request.ma_nguoi_dung, request.ma_cua_hang, tong_tien_san_pham, phi_giao_hang,
-            giam_gia_ma_giam_gia, 0, tong_tien_cuoi_cung,
-            'da_nhan', request.dia_chi_giao_hang, request.so_dien_thoai_giao_hang,
-            request.phuong_thuc_thanh_toan, 'cho_xu_ly', request.ma_giam_gia,
-            request.ghi_chu, request.thoi_gian_giao_du_kien
-        ))
-        
-        ma_don_hang = cursor.lastrowid
-
-        # 9. Chuyển các mặt hàng từ giỏ hàng sang đơn hàng
-        for chi_tiet in chi_tiet_don_hang:
-            mat_hang = chi_tiet['mat_hang']
-            
-            cursor.execute("""
-                INSERT INTO MatHangDonHang (
-                    ma_don_hang, ma_san_pham, ma_combo, loai_mat_hang,
-                    so_luong, don_gia_co_ban, tong_gia_tuy_chon, thanh_tien, ghi_chu
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """, (
-                ma_don_hang, mat_hang['ma_san_pham'], mat_hang['ma_combo'],
-                mat_hang['loai_mat_hang'], mat_hang['so_luong'], mat_hang['gia_san_pham'],
-                chi_tiet['tong_gia_tuy_chon'], chi_tiet['thanh_tien'], mat_hang['ghi_chu']
-            ))
-            
-            ma_mat_hang_don_hang = cursor.lastrowid
-
-            # 10. Chuyển tùy chọn từ giỏ hàng sang đơn hàng
-            if mat_hang['loai_mat_hang'] == 'san_pham':
-                # Tùy chọn sản phẩm đơn lẻ
-                cursor.execute("""
-                    SELECT 
-                        cttcgh.ma_gia_tri,
-                        cttcgh.gia_them,
-                        gtc.ten_gia_tri,
-                        ltc.ten_loai
-                    FROM ChiTietTuyChonGioHang cttcgh
-                    JOIN GiaTriTuyChon gtc ON cttcgh.ma_gia_tri = gtc.ma_gia_tri
-                    JOIN LoaiTuyChon ltc ON gtc.ma_loai_tuy_chon = ltc.ma_loai_tuy_chon
-                    WHERE cttcgh.ma_mat_hang_gio_hang = %s
-                """, (mat_hang['ma_mat_hang_gio_hang'],))
-                
-                tuy_chon_list = cursor.fetchall()
-                
-                for tuy_chon in tuy_chon_list:
-                    cursor.execute("""
-                        INSERT INTO ChiTietTuyChonDonHang (
-                            ma_mat_hang_don_hang, ma_gia_tri, ten_loai_tuy_chon,
-                            ten_gia_tri, gia_them
-                        ) VALUES (%s, %s, %s, %s, %s)
-                    """, (
-                        ma_mat_hang_don_hang, tuy_chon['ma_gia_tri'],
-                        tuy_chon['ten_loai'], tuy_chon['ten_gia_tri'], tuy_chon['gia_them']
-                    ))
-
-            elif mat_hang['loai_mat_hang'] == 'combo':
-                # Chi tiết combo
-                cursor.execute("""
-                    SELECT 
-                        ctcgh.ma_chi_tiet_combo,
-                        ctc.ma_san_pham,
-                        ctc.ten_san_pham,
-                        ctc.so_luong,
-                        ctc.gia_san_pham
-                    FROM ChiTietComboGioHang ctcgh
-                    JOIN ChiTietCombo ctc ON ctcgh.ma_chi_tiet_combo = ctc.ma_chi_tiet_combo
-                    WHERE ctcgh.ma_mat_hang_gio_hang = %s
-                """, (mat_hang['ma_mat_hang_gio_hang'],))
-                
-                chi_tiet_combo_list = cursor.fetchall()
-                
-                for ctc in chi_tiet_combo_list:
-                    cursor.execute("""
-                        INSERT INTO ChiTietComboDonHang (
-                            ma_mat_hang_don_hang, ma_san_pham, ten_san_pham,
-                            so_luong, don_gia
-                        ) VALUES (%s, %s, %s, %s, %s)
-                    """, (
-                        ma_mat_hang_don_hang, ctc['ma_san_pham'], ctc['ten_san_pham'],
-                        ctc['so_luong'], ctc['gia_san_pham']
-                    ))
-                    
-                    ma_chi_tiet_combo_don_hang = cursor.lastrowid
-                    
-                    # Tùy chọn combo
-                    cursor.execute("""
-                        SELECT 
-                            tccgh.ma_gia_tri,
-                            tccgh.gia_them,
-                            gtc.ten_gia_tri,
-                            ltc.ten_loai
-                        FROM TuyChonComboGioHang tccgh
-                        JOIN ChiTietComboGioHang ctcgh ON tccgh.ma_chi_tiet_combo_gio_hang = ctcgh.ma_chi_tiet
-                        JOIN GiaTriTuyChon gtc ON tccgh.ma_gia_tri = gtc.ma_gia_tri
-                        JOIN LoaiTuyChon ltc ON gtc.ma_loai_tuy_chon = ltc.ma_loai_tuy_chon
-                        WHERE ctcgh.ma_mat_hang_gio_hang = %s AND ctcgh.ma_chi_tiet_combo = %s
-                    """, (mat_hang['ma_mat_hang_gio_hang'], ctc['ma_chi_tiet_combo']))
-                    
-                    tuy_chon_combo_list = cursor.fetchall()
-                    
-                    for tuy_chon in tuy_chon_combo_list:
-                        cursor.execute("""
-                            INSERT INTO TuyChonComboDonHang (
-                                ma_chi_tiet_combo_don_hang, ma_gia_tri, ten_loai_tuy_chon,
-                                ten_gia_tri, gia_them
-                            ) VALUES (%s, %s, %s, %s, %s)
-                        """, (
-                            ma_chi_tiet_combo_don_hang, tuy_chon['ma_gia_tri'],
-                            tuy_chon['ten_loai'], tuy_chon['ten_gia_tri'], tuy_chon['gia_them']
-                        ))
-
-        # 11. Cập nhật số lần sử dụng mã giảm giá
-        if request.ma_giam_gia:
-            cursor.execute("""
-                UPDATE MaGiamGia 
-                SET da_su_dung = da_su_dung + 1 
-                WHERE ma_giam_gia = %s
-            """, (request.ma_giam_gia,))
-
-        # 12. Xóa giỏ hàng sau khi đặt hàng thành công
-        cursor.execute("DELETE FROM MatHangGioHang WHERE ma_gio_hang = %s", (ma_gio_hang,))
-
-        # 13. Tạo giao dịch thanh toán
-        cursor.execute("""
-            INSERT INTO GiaoDich (
-                ma_nguoi_dung, loai_giao_dich, so_tien, trang_thai, phuong_thuc_thanh_toan
-            ) VALUES (%s, %s, %s, %s, %s)
-        """, (
-            request.ma_nguoi_dung, 'thanh_toan_don_hang', tong_tien_cuoi_cung,
-            'cho_xu_ly', request.phuong_thuc_thanh_toan
-        ))
-
         conn.commit()
-        cursor.close()
-        conn.close()
 
-        return {
-            "message": "Đặt hàng thành công",
-            "ma_don_hang": ma_don_hang,
-            "tong_tien_san_pham": tong_tien_san_pham,
-            "phi_giao_hang": phi_giao_hang,
-            "giam_gia_ma_giam_gia": giam_gia_ma_giam_gia,
-            "tong_tien_cuoi_cung": tong_tien_cuoi_cung,
-            "trang_thai": "da_nhan",
-            "phuong_thuc_thanh_toan": request.phuong_thuc_thanh_toan
-        }
-
-    except HTTPException as e:
-        raise e
+        # Trả về trang thành công
+        return HTMLResponse(content="""
+        <!DOCTYPE html>
+        <html lang="vi">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Kích hoạt thành công - Pizza App</title>
+            <style>
+                body {
+                    font-family: Arial, sans-serif;
+                    background-color: #f5f5f5;
+                    margin: 0;
+                    padding: 20px;
+                    display: flex;
+                    justify-content: center;
+                    align-items: center;
+                    min-height: 100vh;
+                }
+                .container {
+                    background: white;
+                    padding: 30px;
+                    border-radius: 8px;
+                    box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+                    max-width: 400px;
+                    width: 100%;
+                    text-align: center;
+                }
+                h1 {
+                    color: #2e7d32;
+                    font-size: 24px;
+                    margin-bottom: 15px;
+                }
+                p {
+                    color: #666;
+                    font-size: 16px;
+                    line-height: 1.5;
+                    margin-bottom: 20px;
+                }
+                .info-box {
+                    background-color: #f8f9fa;
+                    padding: 15px;
+                    border-radius: 4px;
+                    margin-bottom: 20px;
+                    border-left: 4px solid #2e7d32;
+                }
+                .btn {
+                    background-color: #2e7d32;
+                    color: white;
+                    padding: 12px 24px;
+                    border: none;
+                    border-radius: 4px;
+                    font-size: 16px;
+                    cursor: pointer;
+                    text-decoration: none;
+                    display: inline-block;
+                    margin: 5px;
+                }
+                .btn:hover {
+                    background-color: #1b5e20;
+                }
+                .btn-secondary {
+                    background-color: #757575;
+                }
+                .btn-secondary:hover {
+                    background-color: #616161;
+                }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>✅ Kích hoạt thành công!</h1>
+                <p>Mật khẩu của bạn đã được kích hoạt thành công.<br>Bạn có thể đăng nhập bằng mật khẩu mới ngay bây giờ.</p>
+                
+                <div class="info-box">
+                    <strong>🔐 Mật khẩu mới đã có hiệu lực</strong><br>
+                    <small>Hãy đăng nhập và đổi lại mật khẩu nếu cần thiết</small>
+                </div>
+                
+                <a href="https://related-burro-selected.ngrok-free.app/dang-nhap" class="btn">Đăng nhập ngay</a>
+                <a href="#" class="btn btn-secondary" onclick="window.close()">Đóng</a>
+            </div>
+        </body>
+        </html>
+        """)
+        
     except Exception as e:
-        if conn:
-            conn.rollback()
-        raise HTTPException(status_code=500, detail=f"Lỗi server: {str(e)}")
+        return HTMLResponse(content="""
+        <!DOCTYPE html>
+        <html lang="vi">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Lỗi - Pizza App</title>
+            <style>
+                body {
+                    font-family: Arial, sans-serif;
+                    background-color: #f5f5f5;
+                    margin: 0;
+                    padding: 20px;
+                    display: flex;
+                    justify-content: center;
+                    align-items: center;
+                    min-height: 100vh;
+                }
+                .container {
+                    background: white;
+                    padding: 30px;
+                    border-radius: 8px;
+                    box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+                    max-width: 400px;
+                    width: 100%;
+                    text-align: center;
+                }
+                h1 {
+                    color: #d32f2f;
+                    font-size: 24px;
+                    margin-bottom: 15px;
+                }
+                p {
+                    color: #666;
+                    font-size: 16px;
+                    line-height: 1.5;
+                    margin-bottom: 20px;
+                }
+                .btn {
+                    background-color: #d32f2f;
+                    color: white;
+                    padding: 12px 24px;
+                    border: none;
+                    border-radius: 4px;
+                    font-size: 16px;
+                    cursor: pointer;
+                    text-decoration: none;
+                    display: inline-block;
+                }
+                .btn:hover {
+                    background-color: #b71c1c;
+                }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>⚠️ Có lỗi xảy ra</h1>
+                <p>Đã có lỗi trong quá trình kích hoạt mật khẩu.<br>Vui lòng thử lại sau.</p>
+                <a href="#" class="btn" onclick="window.close()">Đóng</a>
+            </div>
+        </body>
+        </html>
+        """, status_code=500)
 
-@app.get("/chiTietDonHang/{ma_don_hang}")
-def get_chi_tiet_don_hang(ma_don_hang: int):
-    """Lấy chi tiết đơn hàng"""
-    try:
-        conn = db.connect_to_database()
-        if isinstance(conn, Error):
-            raise HTTPException(status_code=500, detail="Lỗi kết nối cơ sở dữ liệu")
+# API để kiểm tra trạng thái token
+@app.get("/check-activation-token/{token}")
+async def check_activation_token(token: str):
+    conn = db.connect_to_database()
+    cursor = conn.cursor(dictionary=True)
 
-        cursor = conn.cursor(dictionary=True)
+    cursor.execute("""
+        SELECT email, created_at, expires_at, activated FROM pending_password_changes 
+        WHERE activation_token = %s
+    """, (token,))
+    
+    record = cursor.fetchone()
+    if not record:
+        return {"valid": False, "message": "Token không tồn tại"}
+    
+    if record['activated']:
+        return {"valid": False, "message": "Mật khẩu đã được kích hoạt trước đó"}
+    
+    if datetime.now() > record['expires_at']:
+        return {"valid": False, "message": "Link đã hết hạn"}
+    
+    return {
+        "valid": True, 
+        "email": record['email'],
+        "expires_at": record['expires_at'].isoformat()
+    }
 
-        # Lấy thông tin đơn hàng
-        cursor.execute("""
-            SELECT 
-                dh.*,
-                nd.ho_ten,
-                nd.email,
-                tc.ten_cua_hang,
-                tc.dia_chi as dia_chi_cua_hang,
-                mgv.ma_code as ma_giam_gia_code
-            FROM DonHang dh
-            LEFT JOIN NguoiDung nd ON dh.ma_nguoi_dung = nd.ma_nguoi_dung
-            LEFT JOIN ThongTinCuaHang tc ON dh.ma_cua_hang = tc.ma_cua_hang
-            LEFT JOIN MaGiamGia mgv ON dh.ma_giam_gia = mgv.ma_giam_gia
-            WHERE dh.ma_don_hang = %s
-        """, (ma_don_hang,))
+# @app.post("/datHang")
+# def dat_hang(request: DatHangRequest):
+#     """Đặt hàng từ giỏ hàng"""
+#     try:
+#         conn = db.connect_to_database()
+#         if isinstance(conn, Error):
+#             raise HTTPException(status_code=500, detail="Lỗi kết nối cơ sở dữ liệu")
+
+#         cursor = conn.cursor(dictionary=True)
+
+#         # 1. Kiểm tra người dùng tồn tại
+#         cursor.execute("SELECT ma_nguoi_dung FROM NguoiDung WHERE ma_nguoi_dung = %s", 
+#                       (request.ma_nguoi_dung,))
+#         if not cursor.fetchone():
+#             raise HTTPException(status_code=404, detail="Người dùng không tồn tại")
+
+#         # 2. Kiểm tra thông tin giao hàng
+#         cursor.execute("""
+#             SELECT * FROM ThongTinGiaoHang 
+#             WHERE ma_thong_tin_giao_hang = %s AND ma_nguoi_dung = %s
+#         """, (request.ma_thong_tin_giao_hang, request.ma_nguoi_dung))
         
-        don_hang = cursor.fetchone()
-        
-        if not don_hang:
-            raise HTTPException(status_code=404, detail="Đơn hàng không tồn tại")
+#         thong_tin_giao_hang = cursor.fetchone()
+#         if not thong_tin_giao_hang:
+#             raise HTTPException(status_code=404, detail="Thông tin giao hàng không tồn tại")
 
-        # Lấy các mặt hàng trong đơn hàng
-        cursor.execute("""
-            SELECT 
-                mhdh.*,
-                sp.ten_san_pham,
-                sp.hinh_anh,
-                c.ten_combo,
-                c.hinh_anh as hinh_anh_combo
-            FROM MatHangDonHang mhdh
-            LEFT JOIN SanPham sp ON mhdh.ma_san_pham = sp.ma_san_pham
-            LEFT JOIN Combo c ON mhdh.ma_combo = c.ma_combo
-            WHERE mhdh.ma_don_hang = %s
-        """, (ma_don_hang,))
+#         # 3. Lấy giỏ hàng
+#         cursor.execute("SELECT ma_gio_hang FROM GioHang WHERE ma_nguoi_dung = %s", 
+#                       (request.ma_nguoi_dung,))
+#         gio_hang = cursor.fetchone()
         
-        mat_hang_list = cursor.fetchall()
+#         if not gio_hang:
+#             raise HTTPException(status_code=404, detail="Giỏ hàng trống")
 
-        # Lấy chi tiết tùy chọn cho từng mặt hàng
-        for mat_hang in mat_hang_list:
-            if mat_hang['loai_mat_hang'] == 'san_pham':
-                # Tùy chọn sản phẩm đơn lẻ
-                cursor.execute("""
-                    SELECT * FROM ChiTietTuyChonDonHang 
-                    WHERE ma_mat_hang_don_hang = %s
-                """, (mat_hang['ma_mat_hang_don_hang'],))
+#         ma_gio_hang = gio_hang['ma_gio_hang']
+
+#         # 4. Lấy các mặt hàng trong giỏ
+#         cursor.execute("""
+#             SELECT 
+#                 mhgh.ma_mat_hang_gio_hang,
+#                 mhgh.ma_san_pham,
+#                 mhgh.ma_combo,
+#                 mhgh.loai_mat_hang,
+#                 mhgh.so_luong,
+#                 mhgh.gia_san_pham,
+#                 mhgh.ghi_chu,
+#                 sp.ten_san_pham,
+#                 c.ten_combo
+#             FROM MatHangGioHang mhgh
+#             LEFT JOIN SanPham sp ON mhgh.ma_san_pham = sp.ma_san_pham
+#             LEFT JOIN Combo c ON mhgh.ma_combo = c.ma_combo
+#             WHERE mhgh.ma_gio_hang = %s
+#         """, (ma_gio_hang,))
+        
+#         mat_hang_list = cursor.fetchall()
+        
+#         if not mat_hang_list:
+#             raise HTTPException(status_code=400, detail="Giỏ hàng trống")
+
+#         # 5. Tính toán giá tiền
+#         tong_tien_san_pham = 0
+#         chi_tiet_don_hang = []
+
+#         for mat_hang in mat_hang_list:
+#             tong_gia_tuy_chon = 0
+            
+#             # Tính giá tùy chọn cho sản phẩm đơn lẻ
+#             if mat_hang['loai_mat_hang'] == 'san_pham':
+#                 cursor.execute("""
+#                     SELECT gia_them FROM ChiTietTuyChonGioHang 
+#                     WHERE ma_mat_hang_gio_hang = %s
+#                 """, (mat_hang['ma_mat_hang_gio_hang'],))
                 
-                mat_hang['tuy_chon'] = cursor.fetchall()
+#                 tuy_chon_list = cursor.fetchall()
+#                 tong_gia_tuy_chon = sum(tc['gia_them'] for tc in tuy_chon_list)
+            
+#             # Tính giá tùy chọn cho combo
+#             elif mat_hang['loai_mat_hang'] == 'combo':
+#                 cursor.execute("""
+#                     SELECT SUM(tccgh.gia_them) as tong_gia_tuy_chon
+#                     FROM TuyChonComboGioHang tccgh
+#                     JOIN ChiTietComboGioHang ctcgh ON tccgh.ma_chi_tiet_combo_gio_hang = ctcgh.ma_chi_tiet
+#                     WHERE ctcgh.ma_mat_hang_gio_hang = %s
+#                 """, (mat_hang['ma_mat_hang_gio_hang'],))
                 
-            elif mat_hang['loai_mat_hang'] == 'combo':
-                # Chi tiết combo
-                cursor.execute("""
-                    SELECT * FROM ChiTietComboDonHang 
-                    WHERE ma_mat_hang_don_hang = %s
-                """, (mat_hang['ma_mat_hang_don_hang'],))
+#                 result = cursor.fetchone()
+#                 tong_gia_tuy_chon = result['tong_gia_tuy_chon'] or 0
+
+#             thanh_tien = (mat_hang['gia_san_pham'] + tong_gia_tuy_chon) * mat_hang['so_luong']
+#             tong_tien_san_pham += thanh_tien
+            
+#             chi_tiet_don_hang.append({
+#                 'mat_hang': mat_hang,
+#                 'tong_gia_tuy_chon': tong_gia_tuy_chon,
+#                 'thanh_tien': thanh_tien
+#             })
+
+#         # 6. Xử lý mã giảm giá
+#         giam_gia_ma_giam_gia = 0
+#         if request.ma_giam_gia:
+#             cursor.execute("""
+#                 SELECT 
+#                     loai_giam_gia,
+#                     gia_tri_giam,
+#                     gia_tri_don_hang_toi_thieu,
+#                     so_lan_su_dung_toi_da,
+#                     da_su_dung,
+#                     ngay_bat_dau,
+#                     ngay_ket_thuc,
+#                     hoat_dong
+#                 FROM MaGiamGia 
+#                 WHERE ma_giam_gia = %s
+#             """, (request.ma_giam_gia,))
+            
+#             ma_giam_gia_info = cursor.fetchone()
+            
+#             if not ma_giam_gia_info:
+#                 raise HTTPException(status_code=404, detail="Mã giảm giá không tồn tại")
+            
+#             if not ma_giam_gia_info['hoat_dong']:
+#                 raise HTTPException(status_code=400, detail="Mã giảm giá đã hết hiệu lực")
+            
+#             # Kiểm tra thời gian hiệu lực
+#             from datetime import datetime
+#             now = datetime.now().date()
+#             if now < ma_giam_gia_info['ngay_bat_dau'] or now > ma_giam_gia_info['ngay_ket_thuc']:
+#                 raise HTTPException(status_code=400, detail="Mã giảm giá không trong thời gian hiệu lực")
+            
+#             # Kiểm tra điều kiện áp dụng
+#             if ma_giam_gia_info['gia_tri_don_hang_toi_thieu'] and tong_tien_san_pham < ma_giam_gia_info['gia_tri_don_hang_toi_thieu']:
+#                 raise HTTPException(status_code=400, detail=f"Đơn hàng tối thiểu {ma_giam_gia_info['gia_tri_don_hang_toi_thieu']} để áp dụng mã giảm giá")
+            
+#             if ma_giam_gia_info['so_lan_su_dung_toi_da'] and ma_giam_gia_info['da_su_dung'] >= ma_giam_gia_info['so_lan_su_dung_toi_da']:
+#                 raise HTTPException(status_code=400, detail="Mã giảm giá đã hết lượt sử dụng")
+            
+#             # Tính giảm giá
+#             if ma_giam_gia_info['loai_giam_gia'] == 'phan_tram':
+#                 giam_gia_ma_giam_gia = tong_tien_san_pham * ma_giam_gia_info['gia_tri_giam'] / 100
+#             else:  # 'co_dinh'
+#                 giam_gia_ma_giam_gia = ma_giam_gia_info['gia_tri_giam']
+            
+#             # Giảm giá không được vượt quá tổng tiền sản phẩm
+#             giam_gia_ma_giam_gia = min(giam_gia_ma_giam_gia, tong_tien_san_pham)
+
+#         # 7. Tính phí giao hàng (có thể customize logic này)
+#         phi_giao_hang = 30000  # Phí cố định 30k, có thể tính theo khoảng cách
+        
+#         # 8. Tính tổng tiền cuối cùng
+#         tong_tien_cuoi_cung = tong_tien_san_pham + phi_giao_hang - giam_gia_ma_giam_gia
+        
+#         # 9. Tạo đơn hàng - SỬA: Thêm ma_thong_tin_giao_hang và bỏ các field không có trong DB
+#         cursor.execute("""
+#             INSERT INTO DonHang (
+#                 ma_thong_tin_giao_hang, ma_nguoi_dung, tong_tien_san_pham, phi_giao_hang,
+#                 giam_gia_ma_giam_gia, giam_gia_combo, tong_tien_cuoi_cung,
+#                 trang_thai, phuong_thuc_thanh_toan, trang_thai_thanh_toan, 
+#                 ma_giam_gia, ghi_chu, thoi_gian_giao_du_kien
+#             ) VALUES (
+#                 %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+#             )
+#         """, (
+#             request.ma_thong_tin_giao_hang, request.ma_nguoi_dung, tong_tien_san_pham, phi_giao_hang,
+#             giam_gia_ma_giam_gia, 0, tong_tien_cuoi_cung,
+#             'da_nhan', request.phuong_thuc_thanh_toan, 'cho_xu_ly',
+#             request.ma_giam_gia, request.ghi_chu, request.thoi_gian_giao_du_kien
+#         ))
+        
+#         ma_don_hang = cursor.lastrowid
+
+#         # 10. Chuyển các mặt hàng từ giỏ hàng sang đơn hàng
+#         for chi_tiet in chi_tiet_don_hang:
+#             mat_hang = chi_tiet['mat_hang']
+            
+#             cursor.execute("""
+#                 INSERT INTO MatHangDonHang (
+#                     ma_don_hang, ma_san_pham, ma_combo, loai_mat_hang,
+#                     so_luong, don_gia_co_ban, tong_gia_tuy_chon, thanh_tien, ghi_chu
+#                 ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+#             """, (
+#                 ma_don_hang, mat_hang['ma_san_pham'], mat_hang['ma_combo'],
+#                 mat_hang['loai_mat_hang'], mat_hang['so_luong'], mat_hang['gia_san_pham'],
+#                 chi_tiet['tong_gia_tuy_chon'], chi_tiet['thanh_tien'], mat_hang['ghi_chu']
+#             ))
+            
+#             ma_mat_hang_don_hang = cursor.lastrowid
+
+#             # 11. Chuyển tùy chọn từ giỏ hàng sang đơn hàng
+#             if mat_hang['loai_mat_hang'] == 'san_pham':
+#                 # Tùy chọn sản phẩm đơn lẻ
+#                 cursor.execute("""
+#                     SELECT 
+#                         cttcgh.ma_gia_tri,
+#                         cttcgh.gia_them,
+#                         gtc.ten_gia_tri,
+#                         ltc.ten_loai
+#                     FROM ChiTietTuyChonGioHang cttcgh
+#                     JOIN GiaTriTuyChon gtc ON cttcgh.ma_gia_tri = gtc.ma_gia_tri
+#                     JOIN LoaiTuyChon ltc ON gtc.ma_loai_tuy_chon = ltc.ma_loai_tuy_chon
+#                     WHERE cttcgh.ma_mat_hang_gio_hang = %s
+#                 """, (mat_hang['ma_mat_hang_gio_hang'],))
                 
-                chi_tiet_combo = cursor.fetchall()
+#                 tuy_chon_list = cursor.fetchall()
                 
-                # Tùy chọn cho từng sản phẩm trong combo
-                for ctc in chi_tiet_combo:
-                    cursor.execute("""
-                        SELECT * FROM TuyChonComboDonHang 
-                        WHERE ma_chi_tiet_combo_don_hang = %s
-                    """, (ctc['ma_chi_tiet'],))
+#                 for tuy_chon in tuy_chon_list:
+#                     cursor.execute("""
+#                         INSERT INTO ChiTietTuyChonDonHang (
+#                             ma_mat_hang_don_hang, ma_gia_tri, ten_loai_tuy_chon,
+#                             ten_gia_tri, gia_them
+#                         ) VALUES (%s, %s, %s, %s, %s)
+#                     """, (
+#                         ma_mat_hang_don_hang, tuy_chon['ma_gia_tri'],
+#                         tuy_chon['ten_loai'], tuy_chon['ten_gia_tri'], tuy_chon['gia_them']
+#                     ))
+
+#             elif mat_hang['loai_mat_hang'] == 'combo':
+#                 # Chi tiết combo
+#                 cursor.execute("""
+#                     SELECT 
+#                         ctcgh.ma_chi_tiet_combo,
+#                         ctc.ma_san_pham,
+#                         ctc.ten_san_pham,
+#                         ctc.so_luong,
+#                         ctc.gia_san_pham
+#                     FROM ChiTietComboGioHang ctcgh
+#                     JOIN ChiTietCombo ctc ON ctcgh.ma_chi_tiet_combo = ctc.ma_chi_tiet_combo
+#                     WHERE ctcgh.ma_mat_hang_gio_hang = %s
+#                 """, (mat_hang['ma_mat_hang_gio_hang'],))
+                
+#                 chi_tiet_combo_list = cursor.fetchall()
+                
+#                 for ctc in chi_tiet_combo_list:
+#                     cursor.execute("""
+#                         INSERT INTO ChiTietComboDonHang (
+#                             ma_mat_hang_don_hang, ma_san_pham, ten_san_pham,
+#                             so_luong, don_gia
+#                         ) VALUES (%s, %s, %s, %s, %s)
+#                     """, (
+#                         ma_mat_hang_don_hang, ctc['ma_san_pham'], ctc['ten_san_pham'],
+#                         ctc['so_luong'], ctc['gia_san_pham']
+#                     ))
                     
-                    ctc['tuy_chon'] = cursor.fetchall()
+#                     ma_chi_tiet_combo_don_hang = cursor.lastrowid
+                    
+#                     # Tùy chọn combo
+#                     cursor.execute("""
+#                         SELECT 
+#                             tccgh.ma_gia_tri,
+#                             tccgh.gia_them,
+#                             gtc.ten_gia_tri,
+#                             ltc.ten_loai
+#                         FROM TuyChonComboGioHang tccgh
+#                         JOIN ChiTietComboGioHang ctcgh ON tccgh.ma_chi_tiet_combo_gio_hang = ctcgh.ma_chi_tiet
+#                         JOIN GiaTriTuyChon gtc ON tccgh.ma_gia_tri = gtc.ma_gia_tri
+#                         JOIN LoaiTuyChon ltc ON gtc.ma_loai_tuy_chon = ltc.ma_loai_tuy_chon
+#                         WHERE ctcgh.ma_mat_hang_gio_hang = %s AND ctcgh.ma_chi_tiet_combo = %s
+#                     """, (mat_hang['ma_mat_hang_gio_hang'], ctc['ma_chi_tiet_combo']))
+                    
+#                     tuy_chon_combo_list = cursor.fetchall()
+                    
+#                     for tuy_chon in tuy_chon_combo_list:
+#                         cursor.execute("""
+#                             INSERT INTO TuyChonComboDonHang (
+#                                 ma_chi_tiet_combo_don_hang, ma_gia_tri, ten_loai_tuy_chon,
+#                                 ten_gia_tri, gia_them
+#                             ) VALUES (%s, %s, %s, %s, %s)
+#                         """, (
+#                             ma_chi_tiet_combo_don_hang, tuy_chon['ma_gia_tri'],
+#                             tuy_chon['ten_loai'], tuy_chon['ten_gia_tri'], tuy_chon['gia_them']
+#                         ))
+
+#         # 12. Cập nhật số lần sử dụng mã giảm giá
+#         if request.ma_giam_gia:
+#             cursor.execute("""
+#                 UPDATE MaGiamGia 
+#                 SET da_su_dung = da_su_dung + 1 
+#                 WHERE ma_giam_gia = %s
+#             """, (request.ma_giam_gia,))
+
+#         # 13. Xóa giỏ hàng sau khi đặt hàng thành công
+#         cursor.execute("DELETE FROM MatHangGioHang WHERE ma_gio_hang = %s", (ma_gio_hang,))
+
+#         # 14. Tạo giao dịch thanh toán
+#         cursor.execute("""
+#             INSERT INTO GiaoDich (
+#                 ma_nguoi_dung, loai_giao_dich, so_tien, trang_thai, phuong_thuc_thanh_toan
+#             ) VALUES (%s, %s, %s, %s, %s)
+#         """, (
+#             request.ma_nguoi_dung, 'thanh_toan_don_hang', tong_tien_cuoi_cung,
+#             'cho_xu_ly', request.phuong_thuc_thanh_toan
+#         ))
+
+#         conn.commit()
+#         cursor.close()
+#         conn.close()
+
+#         return {
+#             "message": "Đặt hàng thành công",
+#             "ma_don_hang": ma_don_hang,
+#             "tong_tien_san_pham": tong_tien_san_pham,
+#             "phi_giao_hang": phi_giao_hang,
+#             "giam_gia_ma_giam_gia": giam_gia_ma_giam_gia,
+#             "tong_tien_cuoi_cung": tong_tien_cuoi_cung,
+#             "trang_thai": "da_nhan",
+#             "phuong_thuc_thanh_toan": request.phuong_thuc_thanh_toan,
+#             "thong_tin_giao_hang": {
+#                 "ten_nguoi_nhan": thong_tin_giao_hang['ten_nguoi_nhan'],
+#                 "so_dien_thoai": thong_tin_giao_hang['so_dien_thoai_nguoi_nhan'],
+#                 "dia_chi": f"{thong_tin_giao_hang['so_duong']}, {thong_tin_giao_hang['phuong_xa']}, {thong_tin_giao_hang['quan_huyen']}, {thong_tin_giao_hang['tinh_thanh_pho']}"
+#             }
+#         }
+
+#     except HTTPException as e:
+#         raise e
+#     except Exception as e:
+#         if conn:
+#             conn.rollback()
+#         raise HTTPException(status_code=500, detail=f"Lỗi server: {str(e)}")
+
+# @app.get("/chiTietDonHang/{ma_don_hang}")
+# def get_chi_tiet_don_hang(ma_don_hang: int):
+#     """Lấy chi tiết đơn hàng"""
+#     try:
+#         conn = db.connect_to_database()
+#         if isinstance(conn, Error):
+#             raise HTTPException(status_code=500, detail="Lỗi kết nối cơ sở dữ liệu")
+
+#         cursor = conn.cursor(dictionary=True)
+
+#         # Lấy thông tin đơn hàng với thông tin giao hàng
+#         cursor.execute("""
+#             SELECT 
+#                 dh.*,
+#                 nd.ho_ten,
+#                 nd.email,
+#                 ttgh.ten_nguoi_nhan,
+#                 ttgh.so_dien_thoai_nguoi_nhan,
+#                 ttgh.so_duong,
+#                 ttgh.phuong_xa,
+#                 ttgh.quan_huyen,
+#                 ttgh.tinh_thanh_pho,
+#                 ttgh.ghi_chu as ghi_chu_giao_hang,
+#                 mgv.ma_code as ma_giam_gia_code
+#             FROM DonHang dh
+#             LEFT JOIN NguoiDung nd ON dh.ma_nguoi_dung = nd.ma_nguoi_dung
+#             LEFT JOIN ThongTinGiaoHang ttgh ON dh.ma_thong_tin_giao_hang = ttgh.ma_thong_tin_giao_hang
+#             LEFT JOIN MaGiamGia mgv ON dh.ma_giam_gia = mgv.ma_giam_gia
+#             WHERE dh.ma_don_hang = %s
+#         """, (ma_don_hang,))
+        
+#         don_hang = cursor.fetchone()
+        
+#         if not don_hang:
+#             raise HTTPException(status_code=404, detail="Đơn hàng không tồn tại")
+
+#         # Lấy các mặt hàng trong đơn hàng
+#         cursor.execute("""
+#             SELECT 
+#                 mhdh.*,
+#                 sp.ten_san_pham,
+#                 sp.hinh_anh,
+#                 c.ten_combo,
+#                 c.hinh_anh as hinh_anh_combo
+#             FROM MatHangDonHang mhdh
+#             LEFT JOIN SanPham sp ON mhdh.ma_san_pham = sp.ma_san_pham
+#             LEFT JOIN Combo c ON mhdh.ma_combo = c.ma_combo
+#             WHERE mhdh.ma_don_hang = %s
+#         """, (ma_don_hang,))
+        
+#         mat_hang_list = cursor.fetchall()
+
+#         # Lấy chi tiết tùy chọn cho từng mặt hàng
+#         for mat_hang in mat_hang_list:
+#             if mat_hang['loai_mat_hang'] == 'san_pham':
+#                 # Tùy chọn sản phẩm đơn lẻ
+#                 cursor.execute("""
+#                     SELECT * FROM ChiTietTuyChonDonHang 
+#                     WHERE ma_mat_hang_don_hang = %s
+#                 """, (mat_hang['ma_mat_hang_don_hang'],))
                 
-                mat_hang['chi_tiet_combo'] = chi_tiet_combo
+#                 mat_hang['tuy_chon'] = cursor.fetchall()
+                
+#             elif mat_hang['loai_mat_hang'] == 'combo':
+#                 # Chi tiết combo
+#                 cursor.execute("""
+#                     SELECT * FROM ChiTietComboDonHang 
+#                     WHERE ma_mat_hang_don_hang = %s
+#                 """, (mat_hang['ma_mat_hang_don_hang'],))
+                
+#                 chi_tiet_combo = cursor.fetchall()
+                
+#                 # Tùy chọn cho từng sản phẩm trong combo
+#                 for ctc in chi_tiet_combo:
+#                     cursor.execute("""
+#                         SELECT * FROM TuyChonComboDonHang 
+#                         WHERE ma_chi_tiet_combo_don_hang = %s
+#                     """, (ctc['ma_chi_tiet'],))
+                    
+#                     ctc['tuy_chon'] = cursor.fetchall()
+                
+#                 mat_hang['chi_tiet_combo'] = chi_tiet_combo
 
-        cursor.close()
-        conn.close()
+#         cursor.close()
+#         conn.close()
 
-        return {
-            "don_hang": don_hang,
-            "mat_hang": mat_hang_list
-        }
+#         return {
+#             "don_hang": don_hang,
+#             "mat_hang": mat_hang_list
+#         }
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Lỗi server: {str(e)}")
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=f"Lỗi server: {str(e)}")
 
-@app.get("/danhSachDonHang/{ma_nguoi_dung}")
-def get_danh_sach_don_hang(ma_nguoi_dung: int, trang_thai: Optional[str] = None):
-    """Lấy danh sách đơn hàng của người dùng"""
-    try:
-        conn = db.connect_to_database()
-        if isinstance(conn, Error):
-            raise HTTPException(status_code=500, detail="Lỗi kết nối cơ sở dữ liệu")
+# @app.get("/danhSachDonHang/{ma_nguoi_dung}")
+# def get_danh_sach_don_hang(ma_nguoi_dung: int, trang_thai: Optional[str] = None):
+#     """Lấy danh sách đơn hàng của người dùng"""
+#     try:
+#         conn = db.connect_to_database()
+#         if isinstance(conn, Error):
+#             raise HTTPException(status_code=500, detail="Lỗi kết nối cơ sở dữ liệu")
 
-        cursor = conn.cursor(dictionary=True)
+#         cursor = conn.cursor(dictionary=True)
 
-        # Câu truy vấn có điều kiện
-        query = """
-            SELECT 
-                dh.ma_don_hang,
-                dh.tong_tien_cuoi_cung,
-                dh.trang_thai,
-                dh.dia_chi_giao_hang,
-                dh.phuong_thuc_thanh_toan,
-                dh.ngay_tao,
-                dh.thoi_gian_giao_du_kien,
-                COUNT(mhdh.ma_mat_hang_don_hang) as so_mat_hang
-            FROM DonHang dh
-            LEFT JOIN MatHangDonHang mhdh ON dh.ma_don_hang = mhdh.ma_don_hang
-            WHERE dh.ma_nguoi_dung = %s
-        """
+#         # Câu truy vấn có điều kiện - SỬA: Lấy thông tin từ ThongTinGiaoHang
+#         query = """
+#             SELECT 
+#                 dh.ma_don_hang,
+#                 dh.tong_tien_cuoi_cung,
+#                 dh.trang_thai,
+#                 dh.phuong_thuc_thanh_toan,
+#                 dh.ngay_tao,
+#                 dh.thoi_gian_giao_du_kien,
+#                 ttgh.ten_nguoi_nhan,
+#                 ttgh.so_dien_thoai_nguoi_nhan,
+#                 CONCAT(ttgh.so_duong, ', ', ttgh.phuong_xa, ', ', ttgh.quan_huyen, ', ', ttgh.tinh_thanh_pho) as dia_chi_giao_hang,
+#                 COUNT(mhdh.ma_mat_hang_don_hang) as so_mat_hang
+#             FROM DonHang dh
+#             LEFT JOIN MatHangDonHang mhdh ON dh.ma_don_hang = mhdh.ma_don_hang
+#             LEFT JOIN ThongTinGiaoHang ttgh ON dh.ma_thong_tin_giao_hang = ttgh.ma_thong_tin_giao_hang
+#             WHERE dh.ma_nguoi_dung = %s
+#         """
         
-        params = [ma_nguoi_dung]
+#         params = [ma_nguoi_dung]
         
-        if trang_thai:
-            query += " AND dh.trang_thai = %s"
-            params.append(trang_thai)
+#         if trang_thai:
+#             query += " AND dh.trang_thai = %s"
+#             params.append(trang_thai)
         
-        query += """
-            GROUP BY dh.ma_don_hang
-            ORDER BY dh.ngay_tao DESC
-        """
+#         query += """
+#             GROUP BY dh.ma_don_hang
+#             ORDER BY dh.ngay_tao DESC
+#         """
 
-        cursor.execute(query, tuple(params))
-        don_hang_list = cursor.fetchall()
+#         cursor.execute(query, tuple(params))
+#         don_hang_list = cursor.fetchall()
 
-        cursor.close()
-        conn.close()
+#         cursor.close()
+#         conn.close()
 
-        return {
-            "danh_sach_don_hang": don_hang_list,
-            "tong_so_don_hang": len(don_hang_list)
-        }
+#         return {
+#             "danh_sach_don_hang": don_hang_list,
+#             "tong_so_don_hang": len(don_hang_list)
+#         }
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Lỗi server: {str(e)}")
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=f"Lỗi server: {str(e)}")
 
 class TuyChonRequest(BaseModel):
     ma_gia_tri: int
@@ -1015,11 +1807,6 @@ class ThemVaoGioHangRequest(BaseModel):
     tuy_chon: Optional[List[TuyChonRequest]] = []  # Cho sản phẩm đơn lẻ
     chi_tiet_combo: Optional[List[ChiTietComboRequest]] = []  # Cho combo
 
-class CapNhatGioHangRequest(BaseModel):
-    so_luong: int
-    ghi_chu: Optional[str] = None
-    tuy_chon: Optional[List[TuyChonRequest]] = []
-    chi_tiet_combo: Optional[List[ChiTietComboRequest]] = []
 
 @app.get("/layGioHang/{ma_nguoi_dung}")
 def get_gio_hang(ma_nguoi_dung: int):
@@ -1244,6 +2031,12 @@ def them_vao_gio_hang(request: ThemVaoGioHangRequest):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Lỗi server: {str(e)}")
+
+class CapNhatGioHangRequest(BaseModel):
+    so_luong: int
+    ghi_chu: Optional[str] = None
+    tuy_chon: Optional[List[TuyChonRequest]] = []
+    chi_tiet_combo: Optional[List[ChiTietComboRequest]] = []
 
 @app.put("/capNhatGioHang/{ma_mat_hang_gio_hang}")
 def cap_nhat_gio_hang(ma_mat_hang_gio_hang: int, request: CapNhatGioHangRequest):
