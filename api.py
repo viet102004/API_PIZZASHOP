@@ -11,7 +11,7 @@ from pydantic import BaseModel, EmailStr, Field
 from enum import Enum
 from decimal import Decimal
 from fastapi.middleware.cors import CORSMiddleware
-import traceback
+import traceback, re
 import hmac
 import hashlib, base64, requests
 
@@ -19,10 +19,18 @@ app = FastAPI()
 
 UPLOAD_FOLDER = "uploads"
 
-partner_code = "MOMOVMUO20250710"
-access_key = "D0sYXqUpjtp1GQvp"
-secret_key = "VmE6M950wN3BqmNc7RE6vKe2Fs4pyWLH"
-endpoint = "https://payment.momo.vn/v2/gateway/api/create"
+# partner_code = "MOMOVMUO20250710"
+# access_key = "D0sYXqUpjtp1GQvp"
+# secret_key = "VmE6M950wN3BqmNc7RE6vKe2Fs4pyWLH"
+# endpoint = "https://payment.momo.vn/v2/gateway/api/create"
+# urlApp =  "https://related-burro-selected.ngrok-free.app"
+# redirect_url = f"{urlApp}/return"
+# ipn_url = f"{urlApp}/momo-ipn"
+
+partner_code = "MOMO"
+access_key = "F8BBA842ECF85"
+secret_key = "K951B6PE1waDMi640xX08PD3vg6EkVlz"
+endpoint = "https://test-payment.momo.vn/v2/gateway/api/create"
 urlApp =  "https://related-burro-selected.ngrok-free.app"
 redirect_url = f"{urlApp}/return"
 ipn_url = f"{urlApp}/momo-ipn"
@@ -83,7 +91,7 @@ def tao_url_thanh_toan(data: PaymentRequest):
         return {"error": "Chỉ hỗ trợ momo trong ví dụ này"}
     
     # Tạo thông tin đơn hàng
-    order_id = str(data.ma_don_hang)
+    order_id = f"pizzaapp_{data.ma_don_hang}_{int(time.time() * 1000)}"
     request_id = str(uuid.uuid4())
     amount = str(data.so_tien)
     order_info = "Thanh toán đơn hàng #" + order_id
@@ -1479,6 +1487,171 @@ class ProductReviewsResponse(BaseModel):
     diem_trung_binh: float
     danh_sach_danh_gia: List[ReviewResponse]
 
+class OrderReviewResponse(BaseModel):
+    ma_danh_gia: int
+    ma_nguoi_dung: int
+    ma_san_pham: int
+    ma_don_hang: int
+    diem_so: int
+    binh_luan: Optional[str]
+    hinh_anh_danh_gia: Optional[str]
+    ngay_tao: datetime
+    ten_san_pham: str
+    hinh_anh_san_pham: Optional[str]
+    ten_nguoi_danh_gia: Optional[str]
+
+class OrderReviewsListResponse(BaseModel):
+    ma_don_hang: int
+    tong_so_danh_gia: int
+    danh_sach_danh_gia: List[OrderReviewResponse]
+
+# API lấy danh sách đánh giá của một đơn hàng
+@app.get("/danhGia/donHang/{ma_don_hang}")
+def lay_danh_gia_don_hang(ma_don_hang: int):
+    conn = db.connect_to_database()
+    if not conn or isinstance(conn, Error):
+        raise HTTPException(status_code=500, detail="Lỗi kết nối cơ sở dữ liệu")
+
+    try:
+        cursor = conn.cursor()
+
+        # 1. Kiểm tra đơn hàng có tồn tại không
+        cursor.execute("SELECT ma_don_hang FROM DonHang WHERE ma_don_hang = %s", (ma_don_hang,))
+        don_hang = cursor.fetchone()
+        if not don_hang:
+            raise HTTPException(status_code=404, detail="Đơn hàng không tồn tại")
+
+        # 2. Lấy danh sách đánh giá của đơn hàng
+        cursor.execute("""
+            SELECT 
+                dg.ma_danh_gia,
+                dg.ma_nguoi_dung,
+                dg.ma_san_pham,
+                dg.ma_don_hang,
+                dg.diem_so,
+                dg.binh_luan,
+                dg.hinh_anh_danh_gia,
+                dg.ngay_tao,
+                sp.ten_san_pham,
+                sp.hinh_anh as hinh_anh_san_pham,
+                nd.ho_ten as ten_nguoi_danh_gia
+            FROM DanhGia dg
+            INNER JOIN SanPham sp ON dg.ma_san_pham = sp.ma_san_pham
+            INNER JOIN NguoiDung nd ON dg.ma_nguoi_dung = nd.ma_nguoi_dung
+            WHERE dg.ma_don_hang = %s
+            ORDER BY dg.ngay_tao DESC
+        """, (ma_don_hang,))
+
+        danh_gia_data = cursor.fetchall()
+        
+        # 3. Chuyển đổi dữ liệu thành format response
+        danh_sach_danh_gia = []
+        for row in danh_gia_data:
+            danh_gia = OrderReviewResponse(
+                ma_danh_gia=row[0],
+                ma_nguoi_dung=row[1],
+                ma_san_pham=row[2],
+                ma_don_hang=row[3],
+                diem_so=row[4],
+                binh_luan=row[5],
+                hinh_anh_danh_gia=row[6],
+                ngay_tao=row[7],
+                ten_san_pham=row[8],
+                hinh_anh_san_pham=row[9],
+                ten_nguoi_danh_gia=row[10]
+            )
+            danh_sach_danh_gia.append(danh_gia)
+
+        # 4. Trả về response
+        return OrderReviewsListResponse(
+            ma_don_hang=ma_don_hang,
+            tong_so_danh_gia=len(danh_sach_danh_gia),
+            danh_sach_danh_gia=danh_sach_danh_gia
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi xử lý: {str(e)}")
+
+    finally:
+        conn.close()
+
+# Model cho việc lấy danh sách ID sản phẩm đã đánh giá
+class ReviewedProductsResponse(BaseModel):
+    ma_don_hang: int
+    danh_sach_ma_san_pham_da_danh_gia: List[int]
+
+# API lấy danh sách ID sản phẩm đã được đánh giá trong đơn hàng
+# (Phục vụ cho việc kiểm tra trong Android app)
+@app.get("/danhGia/donHang/{ma_don_hang}/daDanhGia")
+def lay_san_pham_da_danh_gia(ma_don_hang: int):
+    conn = db.connect_to_database()
+    if not conn or isinstance(conn, Error):
+        raise HTTPException(status_code=500, detail="Lỗi kết nối cơ sở dữ liệu")
+
+    try:
+        cursor = conn.cursor()
+
+        # 1. Kiểm tra đơn hàng có tồn tại không
+        cursor.execute("SELECT ma_don_hang FROM DonHang WHERE ma_don_hang = %s", (ma_don_hang,))
+        don_hang = cursor.fetchone()
+        if not don_hang:
+            raise HTTPException(status_code=404, detail="Đơn hàng không tồn tại")
+
+        # 2. Lấy danh sách ID sản phẩm đã được đánh giá
+        cursor.execute("""
+            SELECT DISTINCT ma_san_pham
+            FROM DanhGia
+            WHERE ma_don_hang = %s
+        """, (ma_don_hang,))
+
+        results = cursor.fetchall()
+        danh_sach_ma_san_pham = [row[0] for row in results]
+
+        # 3. Trả về response
+        return ReviewedProductsResponse(
+            ma_don_hang=ma_don_hang,
+            danh_sach_ma_san_pham_da_danh_gia=danh_sach_ma_san_pham
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi xử lý: {str(e)}")
+
+    finally:
+        conn.close()
+
+# API kiểm tra một sản phẩm cụ thể đã được đánh giá trong đơn hàng chưa
+@app.get("/danhGia/donHang/{ma_don_hang}/sanPham/{ma_san_pham}/kiemTra")
+def kiem_tra_san_pham_da_danh_gia(ma_don_hang: int, ma_san_pham: int):
+    conn = db.connect_to_database()
+    if not conn or isinstance(conn, Error):
+        raise HTTPException(status_code=500, detail="Lỗi kết nối cơ sở dữ liệu")
+
+    try:
+        cursor = conn.cursor()
+
+        # Kiểm tra sản phẩm đã được đánh giá trong đơn hàng này chưa
+        cursor.execute("""
+            SELECT COUNT(*) as so_luong_danh_gia
+            FROM DanhGia
+            WHERE ma_don_hang = %s AND ma_san_pham = %s
+        """, (ma_don_hang, ma_san_pham))
+
+        result = cursor.fetchone()
+        da_danh_gia = result[0] > 0
+
+        return {
+            "ma_don_hang": ma_don_hang,
+            "ma_san_pham": ma_san_pham,
+            "da_danh_gia": da_danh_gia,
+            "so_luong_danh_gia": result[0]
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi xử lý: {str(e)}")
+
+    finally:
+        conn.close()
+
 @app.get("/danhGia/sanPham/{ma_san_pham}")
 def lay_danh_gia_san_pham(
     ma_san_pham: int,
@@ -1620,7 +1793,8 @@ def lay_thong_ke_danh_gia(ma_san_pham: int):
     finally:
         conn.close()
 
-os.makedirs("static/images/reviews", exist_ok=True)
+save_dir = "/static/images/reviews"
+os.makedirs(save_dir, exist_ok=True)
 
 class ReviewRequest(BaseModel):
     ma_nguoi_dung: int
@@ -1945,6 +2119,15 @@ def get_chi_tiet_don_hang(ma_don_hang: int):
             don_hang.get("tinh_thanh_pho")
         ]))
 
+        # Format ngày tạo thành string để truyền về client
+        ngay_dat_str = None
+        if don_hang.get("ngay_tao"):
+            if isinstance(don_hang["ngay_tao"], str):
+                ngay_dat_str = don_hang["ngay_tao"]
+            else:
+                # Nếu là datetime object, convert thành string
+                ngay_dat_str = don_hang["ngay_tao"].strftime("%Y-%m-%d %H:%M:%S")
+
         return {
             "don_hang": {
                 "ma_don_hang": don_hang["ma_don_hang"],
@@ -1955,6 +2138,7 @@ def get_chi_tiet_don_hang(ma_don_hang: int):
                 "trang_thai": don_hang["trang_thai"],
                 "phuong_thuc_thanh_toan": don_hang["phuong_thuc_thanh_toan"],
                 "trang_thai_thanh_toan": don_hang["trang_thai_thanh_toan"],
+                "ngay_dat": ngay_dat_str,  # ← THÊM FIELD NÀY
                 "ghi_chu": don_hang.get("ghi_chu"),
                 "thoi_gian_giao_du_kien": don_hang.get("thoi_gian_giao_du_kien"),
                 "thong_tin_giao_hang": {
@@ -1974,7 +2158,6 @@ def get_chi_tiet_don_hang(ma_don_hang: int):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Lỗi server: {str(e)}")
-
 @app.get("/tatCaDonHang")
 def lay_tat_ca_don_hang():
     try:
@@ -4243,7 +4426,7 @@ def add_hinh_anh_san_pham(
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Lỗi server: {str(e)}")
-    
+
 @app.post("/themTuyChonCombo")
 def add_tuy_chon_combo(
     ma_chi_tiet_combo: int,
@@ -5233,3 +5416,317 @@ app.add_middleware(       # cái này  của web đừng xóa nha
     allow_methods=["*"],
     allow_headers=["*"],  
 )
+
+@app.get("/thongKeLoaiSanPhamDaMua/{ma_nguoi_dung}")
+def thong_ke_loai_san_pham_da_mua(
+    ma_nguoi_dung: int,
+    thang: str = Query(..., description="Định dạng YYYY-MM (VD: 2024-01)")
+):
+    """
+    API thống kê các loại sản phẩm người dùng đã mua trong tháng
+    
+    Args:
+        ma_nguoi_dung: ID người dùng
+        thang: Tháng thống kê (format: YYYY-MM)
+    
+    Returns:
+        Thống kê chi tiết các loại sản phẩm đã mua
+    """
+    try:
+        # Validate định dạng tháng
+        month_pattern = r'^\d{4}-\d{2}$'
+        if not re.match(month_pattern, thang):
+            raise HTTPException(
+                status_code=400, 
+                detail="Định dạng tháng không hợp lệ. Vui lòng sử dụng format YYYY-MM (VD: 2024-01)"
+            )
+        
+        conn = db.connect_to_database()
+        if isinstance(conn, Error):
+            raise HTTPException(status_code=500, detail="Lỗi kết nối cơ sở dữ liệu")
+        
+        cursor = conn.cursor(dictionary=True)
+        
+        # Kiểm tra người dùng có tồn tại không
+        check_user_sql = """
+            SELECT ma_nguoi_dung, ho_ten, email 
+            FROM NguoiDung 
+            WHERE ma_nguoi_dung = %s AND hoat_dong = TRUE
+        """
+        cursor.execute(check_user_sql, (ma_nguoi_dung,))
+        user_info = cursor.fetchone()
+        
+        if not user_info:
+            raise HTTPException(
+                status_code=404, 
+                detail="Người dùng không tồn tại hoặc đã bị vô hiệu hóa"
+            )
+        
+        # Thống kê sản phẩm theo danh mục
+        thong_ke_danh_muc_sql = """
+            SELECT 
+                COALESCE(dm.ten_danh_muc, 'Không phân loại') as ten_danh_muc,
+                COUNT(DISTINCT sp.ma_san_pham) as so_loai_san_pham,
+                SUM(mhdh.so_luong) as tong_so_luong,
+                SUM(mhdh.thanh_tien) as tong_tien_danh_muc,
+                AVG(mhdh.don_gia_co_ban) as gia_trung_binh
+            FROM DonHang dh
+            INNER JOIN MatHangDonHang mhdh ON dh.ma_don_hang = mhdh.ma_don_hang
+            INNER JOIN SanPham sp ON mhdh.ma_san_pham = sp.ma_san_pham
+            LEFT JOIN DanhMuc dm ON sp.ma_danh_muc = dm.ma_danh_muc
+            WHERE dh.ma_nguoi_dung = %s
+                AND dh.trang_thai = 'hoan_thanh'
+                AND mhdh.loai_mat_hang = 'san_pham'
+                AND DATE_FORMAT(dh.ngay_tao, '%%Y-%%m') = %s
+            GROUP BY dm.ma_danh_muc, dm.ten_danh_muc
+            ORDER BY tong_so_luong DESC, tong_tien_danh_muc DESC
+        """
+        cursor.execute(thong_ke_danh_muc_sql, (ma_nguoi_dung, thang))
+        thong_ke_danh_muc = cursor.fetchall()
+        
+        # Thống kê chi tiết từng sản phẩm
+        chi_tiet_san_pham_sql = """
+            SELECT 
+                sp.ma_san_pham,
+                sp.ten_san_pham,
+                COALESCE(dm.ten_danh_muc, 'Không phân loại') as ten_danh_muc,
+                sp.loai_san_pham,
+                SUM(mhdh.so_luong) as tong_so_luong,
+                COUNT(DISTINCT dh.ma_don_hang) as so_don_hang_chua_san_pham,
+                SUM(mhdh.thanh_tien) as tong_tien_san_pham,
+                AVG(mhdh.don_gia_co_ban) as gia_trung_binh,
+                MIN(dh.ngay_tao) as lan_mua_dau_tien,
+                MAX(dh.ngay_tao) as lan_mua_gan_nhat
+            FROM DonHang dh
+            INNER JOIN MatHangDonHang mhdh ON dh.ma_don_hang = mhdh.ma_don_hang
+            INNER JOIN SanPham sp ON mhdh.ma_san_pham = sp.ma_san_pham
+            LEFT JOIN DanhMuc dm ON sp.ma_danh_muc = dm.ma_danh_muc
+            WHERE dh.ma_nguoi_dung = %s
+                AND dh.trang_thai = 'hoan_thanh'
+                AND mhdh.loai_mat_hang = 'san_pham'
+                AND DATE_FORMAT(dh.ngay_tao, '%%Y-%%m') = %s
+            GROUP BY sp.ma_san_pham, sp.ten_san_pham, dm.ten_danh_muc, sp.loai_san_pham
+            ORDER BY tong_so_luong DESC, tong_tien_san_pham DESC
+        """
+        cursor.execute(chi_tiet_san_pham_sql, (ma_nguoi_dung, thang))
+        chi_tiet_san_pham = cursor.fetchall()
+        
+        # Kiểm tra tất cả đơn hàng của người dùng trong tháng (để debug)
+        debug_sql = """
+            SELECT 
+                dh.ma_don_hang,
+                dh.trang_thai,
+                dh.ngay_tao,
+                DATE_FORMAT(dh.ngay_tao, '%%Y-%%m') as thang_don_hang
+            FROM DonHang dh
+            WHERE dh.ma_nguoi_dung = %s
+                AND DATE_FORMAT(dh.ngay_tao, '%%Y-%%m') = %s
+            ORDER BY dh.ngay_tao DESC
+        """
+        cursor.execute(debug_sql, (ma_nguoi_dung, thang))
+        debug_orders = cursor.fetchall()
+        
+        # Thống kê tổng quan - tách riêng để dễ debug
+        # Đếm tổng số đơn hàng trong tháng (bao gồm cả chưa hoàn thành)
+        tong_don_hang_sql = """
+            SELECT 
+                COUNT(DISTINCT dh.ma_don_hang) as tong_so_don_hang_tat_ca,
+                COUNT(DISTINCT CASE WHEN dh.trang_thai = 'hoan_thanh' THEN dh.ma_don_hang END) as tong_so_don_hang_hoan_thanh
+            FROM DonHang dh
+            WHERE dh.ma_nguoi_dung = %s
+                AND DATE_FORMAT(dh.ngay_tao, '%%Y-%%m') = %s
+        """
+        cursor.execute(tong_don_hang_sql, (ma_nguoi_dung, thang))
+        tong_don_hang = cursor.fetchone()
+        
+        # Thống kê sản phẩm chỉ từ đơn hàng hoàn thành
+        tong_quan_sql = """
+            SELECT 
+                SUM(mhdh.so_luong) as tong_so_luong_san_pham,
+                SUM(mhdh.thanh_tien) as tong_tien_da_chi,
+                COUNT(DISTINCT sp.ma_san_pham) as so_loai_san_pham_khac_nhau,
+                COUNT(DISTINCT dm.ma_danh_muc) as so_danh_muc_da_mua
+            FROM DonHang dh
+            INNER JOIN MatHangDonHang mhdh ON dh.ma_don_hang = mhdh.ma_don_hang
+            INNER JOIN SanPham sp ON mhdh.ma_san_pham = sp.ma_san_pham
+            LEFT JOIN DanhMuc dm ON sp.ma_danh_muc = dm.ma_danh_muc
+            WHERE dh.ma_nguoi_dung = %s
+                AND dh.trang_thai = 'hoan_thanh'
+                AND mhdh.loai_mat_hang = 'san_pham'
+                AND DATE_FORMAT(dh.ngay_tao, '%%Y-%%m') = %s
+        """
+        cursor.execute(tong_quan_sql, (ma_nguoi_dung, thang))
+        tong_quan = cursor.fetchone()
+        
+        # Top 5 sản phẩm mua nhiều nhất
+        top_san_pham_sql = """
+            SELECT 
+                sp.ten_san_pham,
+                SUM(mhdh.so_luong) as so_luong_da_mua,
+                SUM(mhdh.thanh_tien) as tong_tien
+            FROM DonHang dh
+            INNER JOIN MatHangDonHang mhdh ON dh.ma_don_hang = mhdh.ma_don_hang
+            INNER JOIN SanPham sp ON mhdh.ma_san_pham = sp.ma_san_pham
+            WHERE dh.ma_nguoi_dung = %s
+                AND dh.trang_thai = 'hoan_thanh'
+                AND mhdh.loai_mat_hang = 'san_pham'
+                AND DATE_FORMAT(dh.ngay_tao, '%%Y-%%m') = %s
+            GROUP BY sp.ma_san_pham, sp.ten_san_pham
+            ORDER BY so_luong_da_mua DESC
+            LIMIT 5
+        """
+        cursor.execute(top_san_pham_sql, (ma_nguoi_dung, thang))
+        top_san_pham = cursor.fetchall()
+        
+        cursor.close()
+        conn.close()
+        
+        # Format kết quả trả về
+        result = {
+            "thong_tin_nguoi_dung": {
+                "ma_nguoi_dung": user_info["ma_nguoi_dung"],
+                "ho_ten": user_info["ho_ten"],
+                "email": user_info["email"]
+            },
+            "thang_thong_ke": thang,
+            "tong_quan": {
+                "tong_so_don_hang_tat_ca": tong_don_hang["tong_so_don_hang_tat_ca"] or 0,
+                "tong_so_don_hang_hoan_thanh": tong_don_hang["tong_so_don_hang_hoan_thanh"] or 0,
+                "tong_so_luong_san_pham": int(tong_quan["tong_so_luong_san_pham"] or 0),
+                "tong_tien_da_chi": float(tong_quan["tong_tien_da_chi"] or 0),
+                "so_loai_san_pham_khac_nhau": tong_quan["so_loai_san_pham_khac_nhau"] or 0,
+                "so_danh_muc_da_mua": tong_quan["so_danh_muc_da_mua"] or 0
+            },
+            "debug_info": {
+                "so_don_hang_trong_thang": len(debug_orders),
+                "chi_tiet_don_hang": [
+                    {
+                        "ma_don_hang": order["ma_don_hang"],
+                        "trang_thai": order["trang_thai"],
+                        "ngay_tao": order["ngay_tao"].strftime("%Y-%m-%d %H:%M:%S"),
+                        "thang_don_hang": order["thang_don_hang"]
+                    }
+                    for order in debug_orders
+                ]
+            },
+            "thong_ke_theo_danh_muc": [
+                {
+                    "ten_danh_muc": item["ten_danh_muc"],
+                    "so_loai_san_pham": item["so_loai_san_pham"],
+                    "tong_so_luong": int(item["tong_so_luong"]),
+                    "tong_tien_danh_muc": float(item["tong_tien_danh_muc"]),
+                    "gia_trung_binh": float(item["gia_trung_binh"])
+                }
+                for item in thong_ke_danh_muc
+            ],
+            "chi_tiet_san_pham": [
+                {
+                    "ma_san_pham": item["ma_san_pham"],
+                    "ten_san_pham": item["ten_san_pham"],
+                    "ten_danh_muc": item["ten_danh_muc"],
+                    "loai_san_pham": item["loai_san_pham"],
+                    "tong_so_luong": int(item["tong_so_luong"]),
+                    "so_don_hang_chua_san_pham": item["so_don_hang_chua_san_pham"],
+                    "tong_tien_san_pham": float(item["tong_tien_san_pham"]),
+                    "gia_trung_binh": float(item["gia_trung_binh"]),
+                    "lan_mua_dau_tien": item["lan_mua_dau_tien"].strftime("%Y-%m-%d %H:%M:%S"),
+                    "lan_mua_gan_nhat": item["lan_mua_gan_nhat"].strftime("%Y-%m-%d %H:%M:%S")
+                }
+                for item in chi_tiet_san_pham
+            ],
+            "top_5_san_pham_yeu_thich": [
+                {
+                    "ten_san_pham": item["ten_san_pham"],
+                    "so_luong_da_mua": int(item["so_luong_da_mua"]),
+                    "tong_tien": float(item["tong_tien"])
+                }
+                for item in top_san_pham
+            ]
+        }
+        
+        return result
+        
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi server: {str(e)}")
+
+@app.get("/thongKeLoaiSanPhamDaMuaTheoNam/{ma_nguoi_dung}")
+def thong_ke_loai_san_pham_da_mua_theo_nam(
+    ma_nguoi_dung: int,
+    nam: int = Query(..., description="Năm thống kê (VD: 2024)")
+):
+    """
+    API thống kê các loại sản phẩm người dùng đã mua trong năm
+    """
+    try:
+        conn = db.connect_to_database()
+        if isinstance(conn, Error):
+            raise HTTPException(status_code=500, detail="Lỗi kết nối cơ sở dữ liệu")
+        
+        cursor = conn.cursor(dictionary=True)
+        
+        # Kiểm tra người dùng có tồn tại không
+        check_user_sql = """
+            SELECT ma_nguoi_dung, ho_ten, email 
+            FROM NguoiDung 
+            WHERE ma_nguoi_dung = %s AND hoat_dong = TRUE
+        """
+        cursor.execute(check_user_sql, (ma_nguoi_dung,))
+        user_info = cursor.fetchone()
+        
+        if not user_info:
+            raise HTTPException(
+                status_code=404, 
+                detail="Người dùng không tồn tại hoặc đã bị vô hiệu hóa"
+            )
+        
+        # Thống kê theo tháng trong năm
+        thong_ke_theo_thang_sql = """
+            SELECT 
+                DATE_FORMAT(dh.ngay_tao, '%%Y-%%m') as thang,
+                COUNT(DISTINCT dh.ma_don_hang) as so_don_hang,
+                SUM(mhdh.so_luong) as tong_so_luong,
+                SUM(mhdh.thanh_tien) as tong_tien,
+                COUNT(DISTINCT sp.ma_san_pham) as so_loai_san_pham
+            FROM DonHang dh
+            INNER JOIN MatHangDonHang mhdh ON dh.ma_don_hang = mhdh.ma_don_hang
+            INNER JOIN SanPham sp ON mhdh.ma_san_pham = sp.ma_san_pham
+            WHERE dh.ma_nguoi_dung = %s
+                AND dh.trang_thai = 'hoan_thanh'
+                AND mhdh.loai_mat_hang = 'san_pham'
+                AND YEAR(dh.ngay_tao) = %s
+            GROUP BY DATE_FORMAT(dh.ngay_tao, '%%Y-%%m')
+            ORDER BY thang
+        """
+        cursor.execute(thong_ke_theo_thang_sql, (ma_nguoi_dung, nam))
+        thong_ke_theo_thang = cursor.fetchall()
+        
+        cursor.close()
+        conn.close()
+        
+        result = {
+            "thong_tin_nguoi_dung": {
+                "ma_nguoi_dung": user_info["ma_nguoi_dung"],
+                "ho_ten": user_info["ho_ten"],
+                "email": user_info["email"]
+            },
+            "nam_thong_ke": nam,
+            "thong_ke_theo_thang": [
+                {
+                    "thang": item["thang"],
+                    "so_don_hang": item["so_don_hang"],
+                    "tong_so_luong": int(item["tong_so_luong"]),
+                    "tong_tien": float(item["tong_tien"]),
+                    "so_loai_san_pham": item["so_loai_san_pham"]
+                }
+                for item in thong_ke_theo_thang
+            ]
+        }
+        
+        return result
+        
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi server: {str(e)}")
